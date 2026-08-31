@@ -1,0 +1,478 @@
+# USSLP — Argo Rollouts: canary strategies for the price path.
+#
+# ---------------------------------------------------------------------------
+# Which services get a Rollout and which do not
+# ---------------------------------------------------------------------------
+# The three on the price path: api-gateway, pos-integration-gw and
+# label-service. A Rollout replaces a Deployment, so adopting one is a real cost
+# — a different object kind, a different rollback story, an extra controller in
+# the path — and it buys something only where a bad deploy hurts a retailer
+# within seconds.
+#
+# pricing-ai-service is on the price path too and does NOT get one, for a
+# specific reason: the Label Service falls back when a pricing decision does not
+# arrive inside its budget, so a bad pricing canary degrades price optimisation
+# rather than stopping prices reaching shelves. The generic Deployment rollout
+# with maxUnavailable: 0 is the right amount of machinery for that.
+#
+# device-registry, promotion-service and ota-service keep plain Deployments with
+# maxUnavailable: 0. A slow provisioning API or a paused rollout is a delay; a
+# wrong price on a shelf is a compliance exposure. The blast radius does not
+# justify the machinery.
+#
+# ---------------------------------------------------------------------------
+# The steps
+# ---------------------------------------------------------------------------
+#   5%  →  analysis  →  25%  →  analysis  →  100%
+#
+# 5% first because it is the smallest slice that still produces enough traffic
+# for the analysis to be conclusive at the platform's volumes. Below that, the
+# 2-minute rate windows in the analysis templates go sparse and the queries
+# start returning "no data" — which the templates are configured to treat as a
+# failure, so a too-small first step would abort every rollout.
+#
+# A pause between the weight change and the analysis, then the analysis itself.
+# The pause matters: metrics lag traffic by a scrape interval plus a rate
+# window, so analysing immediately after a weight change measures the previous
+# weight.
+#
+# 25% second rather than 50%: at 25% a failure that only manifests under load
+# is visible, and a quarter of traffic is still a quarter.
+#
+# ---------------------------------------------------------------------------
+# Automated rollback
+# ---------------------------------------------------------------------------
+# Every analysis is inline in the steps, so a failed measurement aborts the
+# rollout and Argo Rollouts shifts traffic back to stable immediately. There is
+# also a background analysis that runs for the whole rollout: it catches the
+# regression that only appears after the canary has been up for ten minutes,
+# which a step analysis lasting five cannot.
+#
+# abortScaleDownDelaySeconds keeps the aborted canary's pods alive for half an
+# hour after the rollback. They serve no traffic; they exist so that whoever is
+# debugging at 3 a.m. has the failing pods to look at rather than a description
+# of them.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: usslp-label-service
+  namespace: usslp
+  labels:
+    app.kubernetes.io/name: usslp
+    app.kubernetes.io/component: label-service
+    app.kubernetes.io/part-of: usslp
+    usslp.io/service: label-service
+    usslp.io/tier: price-path
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  replicas: 6
+  revisionHistoryLimit: 5
+  # Longer than the Deployment's default. A rollout that has to be rolled back
+  # needs the previous ReplicaSet's spec intact.
+  progressDeadlineSeconds: 900
+  # On a timeout, abort rather than leave the rollout paused indefinitely.
+  progressDeadlineAbort: true
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: usslp
+      app.kubernetes.io/component: label-service
+  workloadRef:
+    # The pod template comes from the Helm-managed Deployment rather than being
+    # duplicated here. One definition of the container, its probes, its
+    # security context and its resources; the Rollout owns only the strategy.
+    apiVersion: apps/v1
+    kind: Deployment
+    name: usslp-label-service
+    scaleDown: onsuccess
+  strategy:
+    canary:
+      canaryService: usslp-label-service-canary
+      stableService: usslp-label-service-stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: usslp-label-service
+            # These route names are the ones in
+            # deploy/istio/virtualservice.yaml. Renaming a route there silently
+            # stops the traffic shift — the Rollout finds no route to rewrite
+            # and proceeds with 100% on stable, which looks like a successful
+            # canary that tested nothing.
+            routes:
+              - price-update
+              - batch
+          destinationRule:
+            name: usslp-label-service
+            canarySubsetName: canary
+            stableSubsetName: stable
+      # Runs for the whole rollout, not per step.
+      analysis:
+        templates:
+          - templateName: usslp-process-health
+          - templateName: usslp-consumer-lag
+        args:
+          - name: service
+            value: label-service
+          - name: canary-version
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['app.kubernetes.io/version']
+      steps:
+        # ---- 5% --------------------------------------------------------
+        - setWeight: 5
+        - pause:
+            # Two minutes before measuring. The analysis templates use 2-minute
+            # rate windows; measuring sooner measures the previous weight.
+            duration: 2m
+        - analysis:
+            templates:
+              - templateName: usslp-success-rate
+              - templateName: usslp-request-latency
+              - templateName: usslp-price-path-latency
+            args:
+              - name: service
+                value: label-service
+              - name: canary-version
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['app.kubernetes.io/version']
+              - name: p99-threshold-seconds
+                # The service owns 120 ms of the price path; its own HTTP
+                # p99 gate is 400 ms, which leaves room for the batch endpoint
+                # without letting a genuine regression through.
+                value: "0.4"
+        # ---- 25% -------------------------------------------------------
+        - setWeight: 25
+        - pause:
+            duration: 3m
+        - analysis:
+            templates:
+              - templateName: usslp-success-rate
+              - templateName: usslp-request-latency
+              - templateName: usslp-price-path-latency
+            args:
+              - name: service
+                value: label-service
+              - name: canary-version
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['app.kubernetes.io/version']
+              - name: p99-threshold-seconds
+                value: "0.4"
+        # ---- 100% ------------------------------------------------------
+        - setWeight: 100
+      # The canary keeps its pods for 30 minutes after an abort so that the
+      # failing state is available to whoever is debugging it.
+      abortScaleDownDelaySeconds: 1800
+      # Zero unavailable during the shift; the price path has no headroom to
+      # give up mid-deploy.
+      maxUnavailable: 0
+      maxSurge: "25%"
+      # Give a new canary pod time to become ready and start reporting before
+      # any analysis looks at it. Shorter than this and the first measurement
+      # catches a pod that is still rebuilding its read model.
+      scaleDownDelaySeconds: 60
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: usslp-pos-integration-gw
+  namespace: usslp
+  labels:
+    app.kubernetes.io/name: usslp
+    app.kubernetes.io/component: pos-integration-gw
+    app.kubernetes.io/part-of: usslp
+    usslp.io/service: pos-integration-gw
+    usslp.io/tier: price-path
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  replicas: 4
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 900
+  progressDeadlineAbort: true
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: usslp
+      app.kubernetes.io/component: pos-integration-gw
+  workloadRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: usslp-pos-integration-gw
+    scaleDown: onsuccess
+  strategy:
+    canary:
+      canaryService: usslp-pos-integration-gw-canary
+      stableService: usslp-pos-integration-gw-stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: usslp-pos-integration-gw
+            routes:
+              - ingest
+          destinationRule:
+            name: usslp-pos-integration-gw
+            canarySubsetName: canary
+            stableSubsetName: stable
+      analysis:
+        templates:
+          - templateName: usslp-process-health
+        args:
+          - name: service
+            value: uig
+            # NOTE: the metric's `service` label is "uig", not
+            # "pos-integration-gw". obs.NewRuntime takes it from
+            # ServiceName in platform/cmd/uig/service.go, which is the binary's
+            # name. The workload is named for what it does; the metric is named
+            # for what runs. Getting this wrong makes every query return
+            # nothing, and an analysis that returns nothing is an analysis that
+            # tests nothing.
+          - name: canary-version
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['app.kubernetes.io/version']
+      steps:
+        - setWeight: 5
+        - pause:
+            duration: 2m
+        - analysis:
+            templates:
+              - templateName: usslp-success-rate
+              - templateName: usslp-pos-ingest-latency
+            args:
+              - name: service
+                value: uig
+              - name: canary-version
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['app.kubernetes.io/version']
+        - setWeight: 25
+        - pause:
+            duration: 3m
+        - analysis:
+            templates:
+              - templateName: usslp-success-rate
+              - templateName: usslp-pos-ingest-latency
+            args:
+              - name: service
+                value: uig
+              - name: canary-version
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['app.kubernetes.io/version']
+        - setWeight: 100
+      abortScaleDownDelaySeconds: 1800
+      maxUnavailable: 0
+      maxSurge: "25%"
+      scaleDownDelaySeconds: 60
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: usslp-api-gateway
+  namespace: usslp
+  labels:
+    app.kubernetes.io/name: usslp
+    app.kubernetes.io/component: api-gateway
+    app.kubernetes.io/part-of: usslp
+    usslp.io/service: api-gateway
+    usslp.io/tier: price-path
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  replicas: 6
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 900
+  progressDeadlineAbort: true
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: usslp
+      app.kubernetes.io/component: api-gateway
+  workloadRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: usslp-api-gateway
+    scaleDown: onsuccess
+  strategy:
+    canary:
+      canaryService: usslp-api-gateway-canary
+      stableService: usslp-api-gateway-stable
+      trafficRouting:
+        istio:
+          virtualService:
+            name: usslp-api-gateway
+            # Only the `proxy` route. The `stream` route carries long-lived
+            # WebSocket connections, and shifting weight on it would move
+            # established streams — a retailer's live fleet view dropping
+            # mid-deploy looks exactly like an outage to them.
+            routes:
+              - proxy
+          destinationRule:
+            name: usslp-api-gateway
+            canarySubsetName: canary
+            stableSubsetName: stable
+      analysis:
+        templates:
+          - templateName: usslp-process-health
+        args:
+          - name: service
+            value: api-gateway
+          - name: canary-version
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['"'"'app.kubernetes.io/version'"'"']
+      steps:
+        - setWeight: 5
+        - pause:
+            duration: 2m
+        - analysis:
+            templates:
+              - templateName: usslp-success-rate
+              - templateName: usslp-request-latency
+              - templateName: usslp-gateway-health
+            args:
+              - name: service
+                value: api-gateway
+              - name: canary-version
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['"'"'app.kubernetes.io/version'"'"']
+              - name: p99-threshold-seconds
+                # The gateway adds a proxy hop to every request. 250 ms is its
+                # own overhead budget, not the end-to-end number.
+                value: "0.25"
+        - setWeight: 25
+        - pause:
+            duration: 3m
+        - analysis:
+            templates:
+              - templateName: usslp-success-rate
+              - templateName: usslp-request-latency
+              - templateName: usslp-gateway-health
+            args:
+              - name: service
+                value: api-gateway
+              - name: canary-version
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['"'"'app.kubernetes.io/version'"'"']
+              - name: p99-threshold-seconds
+                value: "0.25"
+        - setWeight: 100
+      abortScaleDownDelaySeconds: 1800
+      maxUnavailable: 0
+      maxSurge: "25%"
+      scaleDownDelaySeconds: 60
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: usslp-api-gateway-stable
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+    app.kubernetes.io/component: api-gateway
+spec:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      appProtocol: http
+  selector:
+    app.kubernetes.io/name: usslp
+    app.kubernetes.io/component: api-gateway
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: usslp-api-gateway-canary
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+    app.kubernetes.io/component: api-gateway
+spec:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      appProtocol: http
+  selector:
+    app.kubernetes.io/name: usslp
+    app.kubernetes.io/component: api-gateway
+---
+# The canary and stable Services the traffic routing shifts between. Argo
+# Rollouts manages their selectors — it writes the pod-template-hash of the
+# canary and stable ReplicaSets into them — so they are created empty of
+# anything but the base selector.
+apiVersion: v1
+kind: Service
+metadata:
+  name: usslp-label-service-stable
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+    app.kubernetes.io/component: label-service
+spec:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      appProtocol: http
+  selector:
+    app.kubernetes.io/name: usslp
+    app.kubernetes.io/component: label-service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: usslp-label-service-canary
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+    app.kubernetes.io/component: label-service
+spec:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      appProtocol: http
+  selector:
+    app.kubernetes.io/name: usslp
+    app.kubernetes.io/component: label-service
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: usslp-pos-integration-gw-stable
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+    app.kubernetes.io/component: pos-integration-gw
+spec:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      appProtocol: http
+  selector:
+    app.kubernetes.io/name: usslp
+    app.kubernetes.io/component: pos-integration-gw
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: usslp-pos-integration-gw-canary
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+    app.kubernetes.io/component: pos-integration-gw
+spec:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      appProtocol: http
+  selector:
+    app.kubernetes.io/name: usslp
+    app.kubernetes.io/component: pos-integration-gw

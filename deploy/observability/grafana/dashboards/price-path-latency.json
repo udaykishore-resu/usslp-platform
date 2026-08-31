@@ -1,0 +1,304 @@
+{
+  "uid": "usslp-price-path",
+  "title": "USSLP — Price Path Latency by Hop",
+  "description": "The 3-second budget, hop by hop, against the allocation in docs/architecture/INTERFACE-CONTRACTS.md section 4. Only the hops the platform instruments appear as measurements; the rest are visible as the residual, which is stated rather than hidden.",
+  "tags": ["usslp", "price-path", "slo"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "30s",
+  "time": { "from": "now-3h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "usslp-prometheus" }
+      },
+      {
+        "name": "store",
+        "label": "Store",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(usslp_price_update_e2e_seconds_count, store)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "The budget",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "```\nPOS -> UIG            <=   50 ms   validate, dedupe, normalise, publish\nUIG -> stream         <=   30 ms   durable append (acks=all)\nstream -> Label Svc   <=  120 ms   consume, resolve, price, attest\nLabel Svc -> broker   <=  100 ms   MQTT QoS 1 publish\nbroker -> SGU -> SEC  <=  100 ms   bridge + LAN\nSEC -> label          <=  400 ms   Zigbee, up to 3 hops, attested frame\nlabel refresh         <= 2000 ms   E-Ink full waveform\nACK back to cloud     <=  200 ms   confirmation\n                      ---------\n                        3000 ms\n```\n\nThe end-to-end number is measured from the envelope's `RecordedAt` — the moment USSLP took durable responsibility — to the moment the pixels settled. **Instrumented hops:** UIG ingest, Label Service fan-out, MQTT device publish, SEC-to-label delivery. **Not instrumented:** the POS network hop, the Zigbee radio itself, and the E-Ink waveform, which are visible only in the residual panel below."
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "End to end — p50 / p95 / p99",
+      "description": "The SLO is p99 < 3s. The 3-second line is the budget, not the alert: the alert is a burn rate, because a single window crossing 3s is not the same as burning the month's error budget.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 16, "x": 8, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "usslp:price_path_latency:p50", "legendFormat": "p50" },
+        { "refId": "B", "expr": "usslp:price_path_latency:p95", "legendFormat": "p95" },
+        { "refId": "C", "expr": "usslp:price_path_latency:p99", "legendFormat": "p99" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 5 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 3 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Instrumented hops against their budgets",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 7 }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Hop 1 — UIG ingest p99 (budget 50 ms)",
+      "description": "usslp_uig_ingest_duration_seconds. Its bucket set is UIG-specific (pipeline.IngestBuckets) precisely because obs.LatencyBuckets jumps 0.025 -> 0.05 -> 0.1 and cannot distinguish a gateway at half its budget from one at its limit.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "usslp:hop_uig_ingest:p99", "legendFormat": "p99" },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le, adapter) (rate(usslp_uig_ingest_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99 {{adapter}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.05 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Hop 3 — Label Service fan-out p99 (part of the 120 ms slice)",
+      "description": "usslp_price_fanout_duration_seconds is the wall time of one batch. For a single-label update it is the whole of the service's slice; for a store-wide promotion it is a batch of up to 40,000 and the budget does not apply.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "usslp:hop_label_fanout:p99", "legendFormat": "fan-out p99" },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(usslp_price_fanout_batch_size_bucket[5m])))",
+          "legendFormat": "batch size p99 (labels)"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [
+        {
+          "matcher": { "id": "byName", "options": "batch size p99 (labels)" },
+          "properties": [
+            { "id": "unit", "value": "short" },
+            { "id": "custom.axisPlacement", "value": "right" }
+          ]
+        }
+      ] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Hop 4 — MQTT device publish p99 (budget 100 ms)",
+      "description": "usslp_device_publish_duration_seconds, labelled by store. This is the QoS 1 publish to the owning Shelf Edge Controller's zone topic.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 15 },
+      "targets": [
+        { "refId": "A", "expr": "usslp:hop_device_publish:p99", "legendFormat": "p99 (all stores)" },
+        {
+          "refId": "B",
+          "expr": "topk(10, histogram_quantile(0.99, sum by (le, store) (rate(usslp_device_publish_duration_seconds_bucket{store=~\"$store\"}[5m]))))",
+          "legendFormat": "{{store}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.1 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["max"] } }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Hop 6 — SEC to label p99 by phase (budget 400 ms)",
+      "description": "sec_label_delivery_seconds is measured by the controller itself, labelled by sec and phase. Up to 3 Zigbee hops at ~15 ms per hop plus queueing.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 15 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le, phase) (rate(sec_label_delivery_seconds_bucket[5m])))",
+          "legendFormat": "{{phase}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sec_mesh_hops_bucket[5m])))",
+          "legendFormat": "mesh hops p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.4 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "line" } }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "mesh hops p99" },
+            "properties": [
+              { "id": "unit", "value": "short" },
+              { "id": "custom.axisPlacement", "value": "right" }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Residual — end-to-end minus the instrumented hops",
+      "description": "What is left after subtracting the four measured hops from the end-to-end p99: the durable append, the store bridge and LAN, the E-Ink waveform, and the acknowledgement path. Their combined budget is roughly 2.4 s, most of it the 2-second full waveform. A residual that grows while every measured hop is flat means the problem is at the far end of the mesh, not in the cloud — which is the single most useful thing this dashboard says.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 22 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "usslp:price_path_latency:p99 - (usslp:hop_uig_ingest:p99 + usslp:hop_label_fanout:p99 + usslp:hop_device_publish:p99)",
+          "legendFormat": "residual p99"
+        },
+        { "refId": "B", "expr": "usslp:price_path_latency:p99", "legendFormat": "end to end p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Delivery and attestation",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 29 }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Delivery confirmations by outcome",
+      "description": "confirmed / failed / duplicate / unknown_label, from platform/internal/label/app/delivery.go. `duplicate` is at-least-once delivery working, not a failure; `unknown_label` is an acknowledgement for a label the directory does not know, which usually means a reassignment left a stale retained message behind.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 30 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(usslp_label_delivery_confirmations_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean"] } }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Attestation and compliance refusals",
+      "description": "Any non-zero value here is a full stop on the price path, not a degradation: a label never displays a price it cannot verify. The Label Service's failures are signing failures; the controller's are verification failures against a key ring it may not have synced.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 30 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(usslp_attestation_failures_total[5m]))",
+          "legendFormat": "signing: {{reason}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (reason) (rate(sec_compliance_alerts_total[5m]))",
+          "legendFormat": "controller refusal: {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.0001 }
+            ]
+          },
+          "custom": { "thresholdsStyle": { "mode": "area" } }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum"] } }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Labels awaiting confirmation",
+      "description": "A rising floor is the earliest sign of a store falling off the mesh — earlier than the fleet SLO, because a label with an authorised but unconfirmed update is still `active` in the registry. A spike during a fan-out is expected; a floor that never drains is not.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 37 },
+      "targets": [
+        { "refId": "A", "expr": "usslp:labels_pending_delivery:total", "legendFormat": "total pending" },
+        {
+          "refId": "B",
+          "expr": "topk(10, usslp_labels_pending_delivery{store=~\"$store\"})",
+          "legendFormat": "{{store}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["min", "last"] } }
+    }
+  ]
+}

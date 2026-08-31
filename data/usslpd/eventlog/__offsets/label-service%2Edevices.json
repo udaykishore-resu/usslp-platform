@@ -1,0 +1,1 @@
+{"group":"label-service.devices","offsets":[{"topic":"device-events","partition":0,"offset":77},{"topic":"device-events","partition":1,"offset":77},{"topic":"device-events","partition":2,"offset":78},{"topic":"device-events","partition":3,"offset":77}]}

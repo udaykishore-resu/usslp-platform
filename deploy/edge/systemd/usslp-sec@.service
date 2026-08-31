@@ -1,0 +1,135 @@
+# USSLP Shelf Edge Controller — a templated unit, one instance per controller.
+#
+#   systemctl enable --now usslp-sec@sec-0001
+#
+# A store has roughly 25 controllers per 40,000 labels, one per ~8 m shelf
+# section. In a deployment where the controllers are separate hardware, each box
+# runs one instance of this unit. Where several controller processes share a
+# host — a lab, a small-format store, or the SGU itself acting as its own
+# controller — the template is what makes that a naming decision rather than 25
+# hand-edited unit files.
+#
+# %i is the controller ID. It becomes USSLP_SEC_ID, the StateDirectory, and the
+# SyslogIdentifier, so a journal query for one controller is
+# `journalctl -u usslp-sec@sec-0001`.
+
+[Unit]
+Description=USSLP Shelf Edge Controller %i
+Documentation=https://github.com/usslp/usslp/blob/main/deploy/edge/RUNBOOK.md
+After=network.target usslp-sgu.service
+# Wants, not Requires. A controller whose gateway is restarting must not be
+# stopped: it holds the current price of every label in its zone and will
+# reconnect on its own. Requires would take the whole zone down with the
+# gateway, which is the opposite of what the tier model is for.
+Wants=usslp-sgu.service
+PartOf=usslp-edge.target
+
+[Service]
+Type=exec
+
+User=usslp
+Group=usslp
+
+Environment=USSLP_SEC_ID=%i
+EnvironmentFile=/etc/usslp/sec.env
+# Per-controller overrides, if any. The `-` prefix makes it optional, so a
+# deployment with 25 identical controllers needs no per-instance files at all.
+EnvironmentFile=-/etc/usslp/sec-%i.env
+
+ExecStart=/usr/local/bin/usslp-sec
+
+KillSignal=SIGTERM
+KillMode=mixed
+# The SEC's own drain is USSLP_SHUTDOWN_GRACE, 15s by default — shorter than the
+# gateway's because it has less to flush. TimeoutStopSec must still exceed it.
+TimeoutStopSec=30
+
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+# ---------------------------------------------------------------------------
+# Hardening
+#
+# Stricter than the gateway's in one specific way: the controller is the
+# component that verifies price attestations. It recomputes the digest from the
+# update it is holding and checks it against the key ring it last synced, and a
+# compromised controller must not be able to change a displayed price — only to
+# prevent one from changing, which is visible within three missed heartbeats.
+#
+# The key ring is therefore mounted read-only and the process runs with no
+# capabilities and no writable executable memory.
+# ---------------------------------------------------------------------------
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=usslp/sec-%i
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/usslp/sec-%i
+ReadOnlyPaths=/etc/usslp
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateUsers=true
+
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# Devices. A controller that drives real Zigbee hardware needs its radio; the
+# simulator in this repository does not. DeviceAllow is commented out rather
+# than removed so that the line to add is obvious, and PrivateDevices is on by
+# default because shipping with the radio open would be the wrong default for
+# the build that does not use it.
+PrivateDevices=true
+DevicePolicy=closed
+# For real Zigbee coordinator hardware on a USB serial adapter, replace the two
+# lines above with:
+#   PrivateDevices=false
+#   DevicePolicy=closed
+#   DeviceAllow=/dev/ttyUSB0 rw
+# and add the device path to USSLP_ZIGBEE_DEVICE in /etc/usslp/sec-%i.env.
+# NOTE: edge/cmd/sec in this repository is a simulator and reads no such
+# variable; the line is the integration point, not a feature that exists.
+
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+# The controller talks to exactly one thing: the store's broker, inside the
+# building. It has no business reaching the internet, and this is what enforces
+# that — a compromised controller cannot exfiltrate a store's prices.
+IPAddressAllow=localhost
+IPAddressAllow=10.0.0.0/8
+IPAddressAllow=172.16.0.0/12
+IPAddressAllow=192.168.0.0/16
+
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @cpu-emulation @debug @mount @module @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+
+# A controller manages ~240 labels in its zone plus the mesh state for them.
+MemoryMax=512M
+MemoryHigh=384M
+CPUQuota=100%
+TasksMax=1024
+LimitNOFILE=8192
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=usslp-sec@%i
+
+[Install]
+WantedBy=usslp-edge.target

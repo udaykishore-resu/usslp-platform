@@ -1,0 +1,144 @@
+# USSLP — staging.
+#
+# Staging exists to catch what dev cannot: the NetworkPolicies, the mesh, the
+# External Secrets wiring, the topic provisioning, and the burn-rate alerts
+# against real-ish traffic. So all of those are ON, and the only thing scaled
+# down is the replica count.
+#
+# The rule staging follows: same shape, smaller. A staging environment that
+# differs structurally from production tests the staging configuration.
+
+global:
+  region: us-east-1
+  environment: staging
+  imageRegistry: ghcr.io/usslp
+
+image:
+  pullPolicy: IfNotPresent
+  tag: ""   # set by CI to the commit's immutable tag
+
+externalSecrets:
+  enabled: true
+  refreshInterval: 15m
+  secretStoreRef:
+    name: usslp-cluster-store
+    kind: ClusterSecretStore
+  remotePathPrefix: usslp/staging/us-east-1
+
+istio:
+  enabled: true
+  holdApplicationUntilProxyStarts: true
+
+networkPolicy:
+  enabled: true
+  dnsNamespace: kube-system
+  posSourceCIDRs: []
+
+ingress:
+  enabled: true
+  className: nginx
+  host: usslp.staging.us-east-1.internal
+  annotations:
+    cert-manager.io/cluster-issuer: usslp-internal-ca
+  tls:
+    enabled: true
+    secretName: usslp-staging-tls
+
+gatewayAPI:
+  # Staging is where the Gateway API migration is proved out, so both paths are
+  # live here and only here.
+  enabled: true
+  parentRef:
+    name: usslp-gateway
+    namespace: usslp-gateway
+    sectionName: https
+  hostnames:
+    - usslp.staging.us-east-1.internal
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+  prometheusRule:
+    enabled: true
+
+topicProvisioning:
+  enabled: true
+  # A three-broker MSK cluster. The endpoint comes from the Terraform output
+  # `msk_bootstrap_brokers_sasl_iam`; it is a parameter here, not a fact.
+  bootstrapServers: "b-1.usslp-staging.REPLACE-ME.kafka.us-east-1.amazonaws.com:9098"
+  replicationFactor: 3
+  minInsyncReplicas: 2
+
+priorityClasses:
+  create: true
+
+topologySpread:
+  enabled: true
+
+services:
+  label-service:
+    replicas: {min: 2, max: 8}
+    pdb: {minAvailable: 1}
+    hpa:
+      enabled: true
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target: {type: Utilization, averageUtilization: 70}
+
+  pos-integration-gw:
+    replicas: {min: 2, max: 6}
+    pdb: {minAvailable: 1}
+
+  device-registry:
+    replicas: {min: 2, max: 4}
+    pdb: {minAvailable: 1}
+
+  ota-service:
+    replicas: {min: 2, max: 4}
+    pdb: {minAvailable: 1}
+
+  mqtt-broker:
+    # Three, not five. Three is the smallest cluster that still exercises the
+    # majority-quorum behaviour production depends on; two would test something
+    # production never does.
+    replicas: {min: 3, max: 3}
+    pdb: {minAvailable: 2}
+    resources:
+      requests: {cpu: 500m, memory: 1Gi}
+      limits: {cpu: "2", memory: 4Gi}
+    storage:
+      kind: persistentVolumeClaim
+      size: 20Gi
+      storageClassName: gp3
+      mountPath: /opt/emqx/data
+
+  kafka-connect:
+    replicas: {min: 2, max: 4}
+    pdb: {minAvailable: 1}
+    resources:
+      requests: {cpu: 500m, memory: 1Gi}
+      limits: {cpu: "2", memory: 4Gi}
+
+  api-gateway:
+    replicas: {min: 2, max: 8}
+    pdb: {minAvailable: 1}
+
+  pricing-ai-service:
+    replicas: {min: 2, max: 4}
+    pdb: {minAvailable: 1}
+    resources:
+      requests: {cpu: "1", memory: 2Gi}
+      limits: {cpu: "4", memory: 8Gi}
+
+  promotion-service:
+    replicas: {min: 2, max: 4}
+    pdb: {minAvailable: 1}
+
+  # Half of production's ceiling: staging carries a replayed slice of the
+  # stream, not a chain's worth of it.
+  analytics-service:
+    replicas: {min: 1, max: 4}
+    pdb: {minAvailable: 1}

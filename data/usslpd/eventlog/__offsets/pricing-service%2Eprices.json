@@ -1,0 +1,1 @@
+{"group":"pricing-service.prices","offsets":[{"topic":"price-updates","partition":0,"offset":0},{"topic":"price-updates","partition":1,"offset":0},{"topic":"price-updates","partition":2,"offset":0},{"topic":"price-updates","partition":3,"offset":0}]}

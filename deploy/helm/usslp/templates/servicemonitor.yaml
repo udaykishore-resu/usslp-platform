@@ -1,0 +1,65 @@
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+{{- range $name, $svc := .Values.services }}
+{{- if and $svc.enabled $svc.ports.admin }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "usslp.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "usslp.serviceLabels" (dict "ctx" $ "name" $name "svc" $svc) | nindent 4 }}
+    {{- with $.Values.monitoring.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+spec:
+  selector:
+    matchLabels:
+      {{- include "usslp.serviceSelectorLabels" (dict "ctx" $ "name" $name) | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+      - {{ $.Release.Namespace }}
+  endpoints:
+    - port: admin
+      {{- if eq $name "mqtt-broker" }}
+      # EMQX exports its own series on the dashboard listener, not on a
+      # USSLP-style /metrics. These are emqx_* metrics; USSLP's own view of the
+      # broker link is usslp_mqtt_client_connected, reported by each service.
+      path: /api/v5/prometheus/stats
+      {{- else if eq $name "kafka-connect" }}
+      path: /metrics
+      {{- else }}
+      # obs.AdminServer serves the Prometheus text exposition format directly —
+      # no exporter, no adapter, no push gateway.
+      path: /metrics
+      {{- end }}
+      interval: {{ $.Values.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ $.Values.monitoring.serviceMonitor.scrapeTimeout }}
+      scheme: http
+      # obs.NewRuntime attaches service, version, region and instance as const
+      # labels on every series it exports. honorLabels keeps them instead of
+      # letting Prometheus overwrite `instance` with the pod's host:port, which
+      # would lose the identity the platform's dashboards group by.
+      honorLabels: true
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - targetLabel: usslp_service
+          replacement: {{ $name }}
+      metricRelabelings:
+        # The event log's per-partition series are 1,024 partitions wide on
+        # price-updates alone. They are useful on a specific investigation and
+        # ruinous as a permanent time series, so the per-partition cardinality
+        # is dropped at scrape time and the aggregate is kept by the recording
+        # rules in deploy/observability/prometheus/rules.
+        - sourceLabels: [__name__]
+          regex: 'eventlog_segments'
+          action: drop
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,44 @@
+USSLP {{ .Chart.Version }} ({{ default .Chart.AppVersion .Values.image.tag }})
+region {{ .Values.global.region }} / environment {{ .Values.global.environment }}
+
+Deployed:
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+  {{ printf "%-20s" $name }} {{ default "Deployment" $svc.kind }}  {{ $svc.replicas.min }}–{{ $svc.replicas.max }} replicas, PDB min {{ $svc.pdb.minAvailable }}
+{{- end }}
+{{- end }}
+
+Declared but disabled (no binary exists in the repository yet):
+{{- range $name, $svc := .Values.services }}
+{{- if not $svc.enabled }}
+  {{ $name }}
+{{- end }}
+{{- end }}
+
+Check readiness:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/part-of=usslp
+
+Every binary exposes /healthz, /readyz and /metrics on its admin port. Liveness
+is "the process is scheduling goroutines"; readiness is "dependencies are
+reachable and start-up finished". A failing /readyz is a pod out of the load
+balancer, never a restart:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "usslp.fullname" . }}-label-service 9090:9090
+  curl -s localhost:9090/readyz | jq
+
+{{- if .Values.topicProvisioning.enabled }}
+
+The topic-provisioning hook ran against {{ .Values.topicProvisioning.bootstrapServers }}
+with the partition counts from canon.AllStreams(). Check it:
+
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "usslp.fullname" . }}-topics
+{{- end }}
+
+{{- if eq .Values.global.environment "dev" }}
+
+WARNING: environment is "dev". Log level is debug, pprof is exposed on the admin
+port, and traces are sampled 1-in-1. None of that is safe in a cluster carrying
+real retailer data.
+{{- end }}
+
+Runbooks: deploy/runbooks/ — start with deploy/README.md for the index.

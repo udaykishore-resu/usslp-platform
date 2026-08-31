@@ -1,0 +1,7 @@
+{
+  "name": "pos-integration",
+  "partitions": 4,
+  "retention_hours": 72,
+  "compacted": false,
+  "description": "Raw normalised POS traffic"
+}

@@ -1,0 +1,41 @@
+apiVersion: v2
+name: usslp
+description: >-
+  Universal Smart Shelf Label Platform — the cloud tier. Deploys the USSLP
+  services that exist in this repository (api-gateway, pos-integration-gw,
+  label-service, device-registry, ota-service, pricing-ai-service,
+  promotion-service, analytics-service) plus the infrastructure workloads the
+  platform runs alongside them (the EMQX broker StatefulSet and Kafka Connect).
+type: application
+
+# version is the chart's own version and moves when the templates change.
+version: 0.1.0
+
+# appVersion is a default only. Every environment overrides image.tag, and the
+# release workflow sets it explicitly; a chart that pins an app version is a
+# chart that has to be re-released to deploy a hotfix.
+appVersion: "0.1.0"
+
+kubeVersion: ">=1.28.0-0"
+
+keywords:
+  - retail
+  - electronic-shelf-labels
+  - esl
+  - iot
+  - mqtt
+
+home: https://github.com/usslp/usslp
+sources:
+  - https://github.com/usslp/usslp
+
+maintainers:
+  - name: USSLP Platform Team
+
+annotations:
+  # The chart has no subcharts. EMQX and Kafka Connect are templated directly
+  # rather than pulled in as dependencies because both need USSLP-specific
+  # topology (tenant-scoped ACLs on the broker, canon.AllStreams() partition
+  # counts for Connect) that an upstream chart's values cannot express without
+  # more overriding than templating.
+  usslp.io/no-subcharts: "intentional"

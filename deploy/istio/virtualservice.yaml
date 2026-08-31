@@ -1,0 +1,460 @@
+# USSLP — VirtualServices: timeouts, retries, and canary traffic splitting.
+#
+# ===========================================================================
+# How the timeouts here relate to the latency budget
+# ===========================================================================
+# INTERFACE-CONTRACTS section 4 divides the 3-second price path into hops:
+#
+#   POS → UIG            ≤   50 ms   validate, dedupe, normalise, publish
+#   UIG → stream         ≤   30 ms   durable append (acks=all)
+#   stream → Label Svc   ≤  120 ms   consume, resolve labels, price, attest
+#   Label Svc → broker   ≤  100 ms   MQTT QoS 1 publish
+#   broker → SGU → SEC   ≤  100 ms   bridge + LAN
+#   SEC → label          ≤  400 ms   Zigbee, up to 3 hops, attested frame
+#   label refresh        ≤ 2000 ms   E-Ink full waveform
+#   ACK back to cloud    ≤  200 ms   confirmation
+#
+# A mesh timeout is NOT that budget. The budget is the target — the number the
+# platform is designed to hit and the number the SLO is written against. A
+# timeout is the point at which waiting longer is definitely worse than giving
+# up, and setting it equal to the target would fail every request that was
+# merely slow, converting a latency problem into an availability problem.
+#
+# So each timeout below is roughly an order of magnitude above its hop's budget,
+# with the reasoning stated per route. The budget is enforced by the
+# application, which counts its own breaches
+# (usslp_uig_latency_budget_exceeded_total) and by the SLO burn-rate alerts.
+# The mesh timeout is the backstop.
+#
+# ===========================================================================
+# Retries
+# ===========================================================================
+# Two rules, both learned the hard way:
+#
+#   1. Never retry a non-idempotent write on a 5xx. A 500 may be a request that
+#      was partially applied. USSLP's idempotency guarantees are per-envelope
+#      (Envelope.IdempotencyKey, per-aggregate Version, per-label Sequence),
+#      not per-HTTP-request, so an HTTP retry is only safe where the handler
+#      itself dedupes. Where it does, the retry policy says so and names the
+#      mechanism.
+#
+#   2. perTryTimeout × attempts must be less than timeout. Otherwise the last
+#      attempt is cut off mid-flight by the outer timeout and the caller gets
+#      a 504 that tells them nothing about which attempt failed.
+
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: usslp-pos-integration-gw
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  hosts:
+    - usslp-pos-integration-gw.usslp.svc.cluster.local
+  http:
+    # ---------------------------------------------------------------------
+    # Ingest. The gateway's budget is 50 ms; the timeout is 2 s.
+    #
+    # Why 2 s and not 200 ms: a delivery that takes 300 ms has blown the
+    # budget and is counted as such, but it has still succeeded, and a POS that
+    # gets a 504 will retry — turning one slow request into two. The gateway's
+    # whole design is that a fast 202 is cheaper than a retry.
+    # ---------------------------------------------------------------------
+    - name: ingest
+      match:
+        - uri:
+            prefix: /v1/ingest/
+      route:
+        - destination:
+            host: usslp-pos-integration-gw.usslp.svc.cluster.local
+            subset: stable
+          weight: 100
+        - destination:
+            host: usslp-pos-integration-gw.usslp.svc.cluster.local
+            subset: canary
+          weight: 0
+      timeout: 2s
+      retries:
+        attempts: 2
+        perTryTimeout: 900ms
+        # connect-failure and refused-stream only. Both mean the request never
+        # reached an application handler, so replaying it cannot double-apply
+        # anything. Notably absent: 5xx and gateway-error. The idempotency
+        # guard (idem.Guard, 24 h window, key from adapter-supplied parts) does
+        # make a replay safe, but the guard is the platform's second line of
+        # defence and the mesh should not be the thing that relies on it.
+        retryOn: connect-failure,refused-stream
+        retryRemoteLocalities: false
+    # ---------------------------------------------------------------------
+    # Operator endpoints. Read-mostly, human-driven, no latency budget.
+    # ---------------------------------------------------------------------
+    - name: operator
+      match:
+        - uri:
+            prefix: /v1/bindings
+        - uri:
+            prefix: /v1/deliveries
+      route:
+        - destination:
+            host: usslp-pos-integration-gw.usslp.svc.cluster.local
+            subset: stable
+      timeout: 30s
+      retries:
+        attempts: 2
+        perTryTimeout: 10s
+        retryOn: connect-failure,refused-stream,5xx
+    - name: replay
+      match:
+        - uri:
+            prefix: /v1/replay/
+      route:
+        - destination:
+            host: usslp-pos-integration-gw.usslp.svc.cluster.local
+            subset: stable
+      timeout: 60s
+      # No retries. A replay re-publishes a stored delivery; retrying it on a
+      # 5xx risks publishing it twice, and while the envelope's idempotency key
+      # would suppress the duplicate, an operator watching this endpoint needs
+      # to see exactly one outcome for exactly one deliberate action.
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: usslp-label-service
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  hosts:
+    - usslp-label-service.usslp.svc.cluster.local
+  http:
+    # ---------------------------------------------------------------------
+    # Batch price updates. The binary's own WriteTimeout is 120 s because a
+    # store-wide fan-out legitimately touches 40,000 labels. The mesh timeout
+    # must exceed it, or the mesh cuts off a batch the application was going to
+    # finish — leaving some shelves showing the new promotion and some the old
+    # price, which is the exact failure the drain logic exists to prevent.
+    # ---------------------------------------------------------------------
+    - name: batch
+      match:
+        - uri:
+            exact: /v1/prices:batch
+      route:
+        - destination:
+            host: usslp-label-service.usslp.svc.cluster.local
+            subset: stable
+          weight: 100
+        - destination:
+            host: usslp-label-service.usslp.svc.cluster.local
+            subset: canary
+          weight: 0
+      timeout: 180s
+      # No retries at all. Re-sending a 40,000-label batch because the response
+      # was lost doubles the work on a service that is already the bottleneck.
+      # The batch is idempotent per envelope, so a client that genuinely needs
+      # to retry can, deliberately, with the same idempotency key.
+    # ---------------------------------------------------------------------
+    # Single-label price update. This is the hop that owns 120 ms.
+    # ---------------------------------------------------------------------
+    - name: price-update
+      match:
+        - uri:
+            prefix: /v1/labels/
+      route:
+        - destination:
+            host: usslp-label-service.usslp.svc.cluster.local
+            subset: stable
+          weight: 100
+        - destination:
+            host: usslp-label-service.usslp.svc.cluster.local
+            subset: canary
+          weight: 0
+      timeout: 3s
+      retries:
+        attempts: 2
+        perTryTimeout: 1200ms
+        retryOn: connect-failure,refused-stream
+    - name: reads
+      match:
+        - uri:
+            prefix: /v1/stores/
+      route:
+        - destination:
+            host: usslp-label-service.usslp.svc.cluster.local
+            subset: stable
+      timeout: 15s
+      retries:
+        attempts: 3
+        perTryTimeout: 4s
+        # Reads are safe to retry on anything.
+        retryOn: connect-failure,refused-stream,5xx,retriable-status-codes
+        retriableStatusCodes: [503]
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: usslp-device-registry
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  hosts:
+    - usslp-device-registry.usslp.svc.cluster.local
+  http:
+    - name: planogram
+      match:
+        - uri:
+            prefix: /v1/stores/
+            # A hypermarket's planogram is megabytes over a store's broadband.
+            # The binary allows two minutes; so does this.
+      route:
+        - destination:
+            host: usslp-device-registry.usslp.svc.cluster.local
+      timeout: 180s
+    - name: provisioning
+      match:
+        - uri:
+            prefix: /v1/provision
+        - uri:
+            prefix: /v1/manifests
+      route:
+        - destination:
+            host: usslp-device-registry.usslp.svc.cluster.local
+      timeout: 30s
+      # No retries. Provisioning mints a device identity against a certificate
+      # hierarchy. A retry that succeeds after a lost response enrols the
+      # device twice, and the second identity is one nobody knows exists.
+    - name: reads
+      match:
+        - uri:
+            prefix: /v1/devices/
+        - uri:
+            prefix: /v1/fleet/
+      route:
+        - destination:
+            host: usslp-device-registry.usslp.svc.cluster.local
+      timeout: 15s
+      retries:
+        attempts: 3
+        perTryTimeout: 4s
+        retryOn: connect-failure,refused-stream,5xx
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: usslp-ota-service
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  hosts:
+    - usslp-ota-service.usslp.svc.cluster.local
+  http:
+    - name: firmware-upload
+      match:
+        - uri:
+            prefix: /v1/firmware
+      route:
+        - destination:
+            host: usslp-ota-service.usslp.svc.cluster.local
+      # A firmware artifact is tens of megabytes and is verified against the
+      # signing key ring before it is accepted.
+      timeout: 300s
+    - name: job-control
+      match:
+        - uri:
+            prefix: /v1/ota/
+      route:
+        - destination:
+            host: usslp-ota-service.usslp.svc.cluster.local
+      timeout: 30s
+      # Never retried, matching the DestinationRule's maxRetries: 0. Every one
+      # of pause/resume/abort/rollback is a decision a human made once.
+    - name: results
+      match:
+        - uri:
+            prefix: /v1/ota/results
+      route:
+        - destination:
+            host: usslp-ota-service.usslp.svc.cluster.local
+      timeout: 10s
+      retries:
+        attempts: 3
+        perTryTimeout: 3s
+        # Safe: a device result is keyed by device and job, and recording the
+        # same outcome twice is a no-op.
+        retryOn: connect-failure,refused-stream,5xx
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: usslp-api-gateway
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  hosts:
+    - usslp-api-gateway.usslp.svc.cluster.local
+  http:
+    - name: stream
+      match:
+        - uri:
+            prefix: /v1/stream
+      route:
+        - destination:
+            host: usslp-api-gateway.usslp.svc.cluster.local
+            subset: stable
+      # No timeout at all on the WebSocket route. A `timeout` on a long-lived
+      # upgrade closes the stream at that interval regardless of health, which
+      # looks to a retailer like the platform dropping their live fleet view
+      # every N minutes for no reason.
+      timeout: 0s
+    - name: proxy
+      match:
+        - uri:
+            prefix: /v1/
+      route:
+        - destination:
+            host: usslp-api-gateway.usslp.svc.cluster.local
+            subset: stable
+          weight: 100
+        - destination:
+            host: usslp-api-gateway.usslp.svc.cluster.local
+            subset: canary
+          weight: 0
+      # Generous, because this route fans out to every other service and the
+      # slowest of them (a store-wide batch, a planogram upload) is what bounds
+      # it. The gateway has its own per-upstream timeouts and circuit breakers,
+      # which are the controls that actually matter here; this is the backstop.
+      timeout: 190s
+      retries:
+        attempts: 2
+        perTryTimeout: 90s
+        # The gateway is a proxy, so a connect-failure means the request never
+        # reached a gateway pod, let alone an upstream. Nothing else is safe:
+        # a 5xx from here may be a 5xx the upstream already applied.
+        retryOn: connect-failure,refused-stream
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: usslp-pricing-ai-service
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  hosts:
+    - usslp-pricing-ai-service.usslp.svc.cluster.local
+  http:
+    - name: decide
+      match:
+        - uri:
+            prefix: /v1/pricing
+      route:
+        - destination:
+            host: usslp-pricing-ai-service.usslp.svc.cluster.local
+            subset: stable
+          weight: 100
+        - destination:
+            host: usslp-pricing-ai-service.usslp.svc.cluster.local
+            subset: canary
+          weight: 0
+      # 1 second against a 10 ms Tier 1 budget. Two orders of magnitude, and
+      # deliberately so: a decision that takes a second has already missed its
+      # budget by a hundredfold and the caller has fallen back — but cutting it
+      # off at 20 ms would turn every GC pause into an error.
+      timeout: 1s
+      # No retries. See the DestinationRule: a retry costs more than the budget.
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: usslp-promotion-service
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  hosts:
+    - usslp-promotion-service.usslp.svc.cluster.local
+  http:
+    - name: promotions
+      match:
+        - uri:
+            prefix: /v1/promotions
+      route:
+        - destination:
+            host: usslp-promotion-service.usslp.svc.cluster.local
+      # A chain-wide activation fans out to every zone in every store.
+      timeout: 120s
+      retries:
+        attempts: 2
+        perTryTimeout: 50s
+        retryOn: connect-failure,refused-stream
+---
+# ===========================================================================
+# Canary traffic splitting
+# ===========================================================================
+# The weights above are the steady state: 100% stable, 0% canary, with the
+# canary subset present so the reference is always valid.
+#
+# Argo Rollouts rewrites these weights during a deployment — 5% → 25% → 100%,
+# with an analysis run at each step against the real SLI metrics. See
+# deploy/argocd/rollouts/. The Rollout owns the numbers; this file owns the
+# structure, which is why the routes are named: `spec.strategy.canary.
+# trafficRouting.istio.virtualService.routes` refers to them by name, and a
+# renamed route silently stops the traffic shift.
+#
+# The `header-canary` route below is the manual override: a request carrying
+# x-usslp-canary: always goes to the canary regardless of weight. It is how a
+# release engineer smoke-tests a canary before letting real traffic near it,
+# and it is deliberately matched *before* the weighted routes in each
+# VirtualService would be — Istio evaluates http rules in order, so this
+# separate VirtualService for a distinct host is the safe way to express it
+# without reordering the price path's rules.
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: usslp-canary-override
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+  annotations:
+    usslp.io/purpose: >-
+      Manual canary access for smoke tests. Requests to canary.usslp.internal
+      carrying x-usslp-canary: true reach the canary subset directly. Not part
+      of the automated rollout; a human tool.
+spec:
+  hosts:
+    - canary.usslp.internal
+  gateways:
+    - istio-system/usslp-internal-gateway
+  http:
+    - name: header-canary-label-service
+      match:
+        - headers:
+            x-usslp-canary:
+              exact: "true"
+          uri:
+            prefix: /label-service/
+      rewrite:
+        uri: /
+      route:
+        - destination:
+            host: usslp-label-service.usslp.svc.cluster.local
+            subset: canary
+      timeout: 30s
+    - name: header-canary-pos-gw
+      match:
+        - headers:
+            x-usslp-canary:
+              exact: "true"
+          uri:
+            prefix: /pos-integration-gw/
+      rewrite:
+        uri: /
+      route:
+        - destination:
+            host: usslp-pos-integration-gw.usslp.svc.cluster.local
+            subset: canary
+      timeout: 30s

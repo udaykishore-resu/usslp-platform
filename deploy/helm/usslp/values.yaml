@@ -1,0 +1,1224 @@
+# USSLP — default values.
+#
+# Everything in this file is a documented parameter with a defensible default.
+# Nothing here is a fact about a real account: registries, hosted zones, IAM
+# role ARNs and secret paths are placeholders that the per-environment values
+# files override, and the chart fails loudly rather than deploying a
+# placeholder into a production cluster (see templates/_helpers.tpl,
+# `usslp.validate`).
+#
+# The resource requests, limits, replica ranges, HPA targets and PDB minimums
+# below are transcribed from the platform specification's capacity table. They
+# are not tuned guesses; change them there first.
+
+global:
+  # The region this release runs in. It becomes USSLP_REGION on every pod,
+  # which is a const label on every metric the process exports
+  # (platform/pkg/obs/runtime.go). A p99 computed across three regions is an
+  # average of unrelated populations, so this must be right.
+  region: us-east-1
+  # dev | staging | prod. Drives log level and format defaults inside the
+  # binaries themselves (platform/pkg/config/config.go LoadService).
+  environment: prod
+  # Registry prefix. The Gatekeeper and Kyverno policies in deploy/policy
+  # allow-list registries; a value not on that list is rejected at admission.
+  imageRegistry: ghcr.io/usslp
+  imagePullSecrets: []
+  clusterDomain: cluster.local
+  # Tenants whose data may be processed in this region. Empty means "no
+  # restriction", which is only correct for us-east-1; the EU and India values
+  # files set it, and the NetworkPolicy and the OPA constraints use it.
+  dataResidency:
+    enforced: false
+    allowedTenantClasses: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # Per-service repository names are appended to global.imageRegistry.
+  pullPolicy: IfNotPresent
+  # tag defaults to .Chart.AppVersion when empty. CI sets it to the immutable
+  # digest-bearing tag; :latest is rejected by admission policy.
+  tag: ""
+
+# ---------------------------------------------------------------------------
+# Pod security
+#
+# Applied to every workload in the chart. runAsUser 65532 is distroless'
+# `nonroot`; the images declare USER 65532:65532 as well, so a cluster that
+# enforces runAsNonRoot without a numeric UID still admits them.
+#
+# readOnlyRootFilesystem is true and every service that writes gets an explicit
+# emptyDir or PVC for USSLP_DATA_DIR. A service that needs to write somewhere
+# the chart did not anticipate will crash on start-up, which is the point: it
+# surfaces as a failed rollout rather than as an unauditable writable layer.
+# ---------------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  privileged: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+serviceAccount:
+  create: true
+  automountServiceAccountToken: false
+  # IRSA. The per-service role ARN is set in the environment values files;
+  # eks.amazonaws.com/role-arn is added only when a service declares
+  # `iamRoleArn`, so a service with no AWS dependency gets no role at all.
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Priority
+#
+# The price path outranks everything else because a shelf showing the wrong
+# price is a compliance incident, while an hour of missing analytics is a
+# reporting gap. Under node pressure the kubelet evicts by priority, so these
+# numbers are the platform's statement of what it is willing to lose.
+# ---------------------------------------------------------------------------
+priorityClasses:
+  create: true
+  classes:
+    usslp-price-path:
+      value: 1000000
+      description: >-
+        Price path: pos-integration-gw, label-service, mqtt-broker. Losing one
+        of these stops prices reaching shelves, which is a regulatory exposure.
+    usslp-platform:
+      value: 500000
+      description: >-
+        Platform services: device-registry, ota-service, kafka-connect.
+        Degraded operation is tolerable for minutes, not hours.
+    usslp-analytics:
+      value: 100000
+      description: >-
+        Analytics and reporting. Preemptible: an hour of backlog is recovered
+        by replaying the stream.
+
+# ---------------------------------------------------------------------------
+# Spread
+#
+# Two constraints, both ScheduleAnyway rather than DoNotSchedule.
+# DoNotSchedule on a zone constraint turns a single-AZ outage into an inability
+# to reschedule the pods that survived it, which is precisely backwards.
+# ---------------------------------------------------------------------------
+topologySpread:
+  enabled: true
+  zone:
+    maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+  node:
+    maxSkew: 2
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# ---------------------------------------------------------------------------
+# Secrets — External Secrets Operator
+#
+# The chart never templates a Secret's data. Every credential is an
+# ExternalSecret pointing at a ClusterSecretStore; the operator writes the
+# Secret, and a `helm template` of this chart therefore cannot leak one.
+# ---------------------------------------------------------------------------
+externalSecrets:
+  enabled: true
+  refreshInterval: 1h
+  secretStoreRef:
+    name: usslp-cluster-store
+    kind: ClusterSecretStore
+  # Prefix under which the region's secrets live in the backing store. The
+  # per-region values files override this; nothing in this repository knows a
+  # real path.
+  remotePathPrefix: usslp/REPLACE-ME
+
+# ---------------------------------------------------------------------------
+# Networking
+# ---------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # CIDRs allowed to reach pos-integration-gw's ingest port directly, in
+  # addition to the ingress controller. Empty by default: POS traffic arrives
+  # through the gateway, not through a hole in the policy.
+  posSourceCIDRs: []
+  # Egress to the cluster's DNS service. Named so that a cluster running
+  # something other than kube-dns can point it elsewhere.
+  dnsNamespace: kube-system
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  # The public hostname. A placeholder; every environment overrides it.
+  host: usslp.REPLACE-ME.example
+  tls:
+    enabled: true
+    secretName: usslp-tls
+
+gatewayAPI:
+  # Gateway API is the direction of travel; Ingress remains for clusters that
+  # have not adopted it. Enabling both is supported and produces two paths to
+  # the same Services, which is the normal migration state.
+  enabled: false
+  # The chart creates HTTPRoutes only. The Gateway itself is cluster
+  # infrastructure with its own lifecycle and its own certificate, and a chart
+  # that owns it makes every service release a load-balancer change.
+  parentRef:
+    name: usslp-gateway
+    namespace: usslp-gateway
+    sectionName: https
+  hostnames:
+    - usslp.REPLACE-ME.example
+
+istio:
+  enabled: true
+  # STRICT mTLS, outlier detection and the retry/timeout budgets live in
+  # deploy/istio and are applied outside the chart, because they are mesh
+  # policy with a different blast radius than a service release. The flag here
+  # only controls the sidecar injection label and the holdApplicationUntilProxy
+  # annotation.
+  holdApplicationUntilProxyStarts: true
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    scrapeTimeout: 10s
+    # The label Prometheus Operator selects ServiceMonitors by. A cluster whose
+    # Prometheus selects something else will silently scrape nothing, which is
+    # why it is explicit rather than assumed.
+    labels:
+      release: kube-prometheus-stack
+  prometheusRule:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack
+
+# ---------------------------------------------------------------------------
+# Services
+#
+# `kind` is Deployment unless stated. Every USSLP binary reads its listen
+# addresses from the environment; the chart pins them to 0.0.0.0 because three
+# of the four binaries default to 127.0.0.1 (device-registry and ota-service in
+# their own main.go, and the SGU's diagnostics port), which is correct for an
+# appliance and useless in a pod.
+# ---------------------------------------------------------------------------
+services:
+
+  # -------------------------------------------------------------------------
+  # label-service — attestation, fan-out, delivery confirmation.
+  # Owns 120 ms of the 3-second price path.
+  # -------------------------------------------------------------------------
+  label-service:
+    enabled: true
+    kind: Deployment
+    image:
+      repository: label-service
+    priorityClassName: usslp-price-path
+    ports:
+      http: 8080
+      admin: 9090
+    replicas:
+      min: 6
+      max: 30
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+    hpa:
+      enabled: true
+      # CPU 70%. The fan-out is CPU-bound: Ed25519 signing plus JSON encoding
+      # per label, 40,000 labels for a store-wide promotion.
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+      behavior:
+        scaleUp:
+          # 60s rather than 0s: a store-wide batch is a legitimate CPU spike
+          # that finishes on its own, and scaling out mid-batch adds consumers
+          # to a partition set that is already assigned.
+          stabilizationWindowSeconds: 60
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 600
+          policies:
+            - type: Percent
+              value: 25
+              periodSeconds: 120
+    pdb:
+      # minAvailable 4 of a 6-pod floor. Four pods is what carries peak price
+      # traffic for one region with one AZ lost; the budget therefore permits a
+      # node drain to take two, and refuses to take a third.
+      minAvailable: 4
+    # The binary's own drain is a compile-time constant in
+    # platform/cmd/label-service/main.go: `const shutdownGrace = 20 * time.Second`.
+    # It is NOT configurable by environment variable. terminationGracePeriodSeconds
+    # must exceed it or the drain is pointless — a store-wide fan-out in flight
+    # when SIGTERM arrives has up to 40,000 labels left to publish.
+    drainTimeoutSeconds: 20
+    terminationGracePeriodSeconds: 45
+    env:
+      USSLP_LABEL_HTTP_ADDR: "0.0.0.0:8080"
+      USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_DEFAULT_CURRENCY: USD
+      USSLP_SCHEDULER_TICK: 1s
+      USSLP_SNAPSHOT_EVERY: "1000"
+      USSLP_TENANT_RATE_PER_SECOND: "20000"
+      USSLP_TENANT_BURST: "40000"
+    # MQTT credentials and the price-authority key material.
+    secrets:
+      - name: mqtt
+        remoteKey: label-service/mqtt
+        # config.Loader resolves NAME_FILE before NAME, so a projected file is
+        # preferred over an environment variable for anything secret.
+        mountPath: /run/secrets/mqtt
+        envFiles:
+          USSLP_MQTT_USERNAME_FILE: /run/secrets/mqtt/username
+          USSLP_MQTT_PASSWORD_FILE: /run/secrets/mqtt/password
+      - name: price-authority
+        remoteKey: label-service/price-authority
+        mountPath: /run/secrets/price-authority
+        env:
+          USSLP_PRICE_AUTHORITY_DIR: /run/secrets/price-authority
+    storage:
+      # emptyDir, not a PVC. The Label Service's kvstore holds the event store
+      # and the directory read model, both of which it rebuilds from the stream
+      # on start-up; a PVC would bind a stateless replica to an AZ for no gain.
+      kind: emptyDir
+      sizeLimit: 8Gi
+      mountPath: /var/lib/usslp
+    ingressPaths:
+      - path: /v1/labels
+        pathType: Prefix
+      - path: /v1/prices:batch
+        pathType: Exact
+      - path: /v1/stores
+        pathType: Prefix
+
+  # -------------------------------------------------------------------------
+  # pos-integration-gw — the Universal Integration Gateway (binary: uig).
+  # Owns 50 ms of the price path.
+  # -------------------------------------------------------------------------
+  pos-integration-gw:
+    enabled: true
+    kind: Deployment
+    image:
+      # The binary and its cmd/ directory are named `uig`; the workload is named
+      # for what it does. build.sh publishes ghcr.io/usslp/uig.
+      repository: uig
+    priorityClassName: usslp-price-path
+    ports:
+      http: 8080
+      admin: 9090
+    replicas:
+      min: 4
+      max: 20
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+    hpa:
+      enabled: true
+      # RPS-based. usslp_requests_total is obs.StandardMetrics' inbound counter
+      # (labels: transport, operation, outcome), exposed to the HPA through
+      # prometheus-adapter as `usslp_requests_per_second`. See
+      # deploy/observability/prometheus/rules/recording-rules.yaml, which
+      # defines the recording rule the adapter reads.
+      metrics:
+        - type: Pods
+          pods:
+            metric:
+              name: usslp_requests_per_second
+            target:
+              type: AverageValue
+              # 400 rps per pod. The gateway's own budget is 50 ms per delivery;
+              # 400 rps at 50 ms is 20 concurrent deliveries per pod, which sits
+              # well inside the 1-core limit.
+              averageValue: "400"
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 75
+      behavior:
+        scaleUp:
+          # A POS that is kept waiting retries, and a retry is more work for
+          # everyone than a fast 202. Scale out immediately.
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 30
+            - type: Pods
+              value: 4
+              periodSeconds: 30
+          selectPolicy: Max
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 120
+    pdb:
+      # 3 of a 4-pod floor. The gateway is the platform's front door for every
+      # retailer's POS; a voluntary disruption may take one pod, never two.
+      minAvailable: 3
+    drainTimeoutSeconds: 20
+    terminationGracePeriodSeconds: 45
+    env:
+      USSLP_UIG_ADDR: "0.0.0.0:8080"
+      USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_UIG_SHUTDOWN_GRACE: 20s
+      # Contract section 6 fixes the idempotency window at 24 hours.
+      USSLP_UIG_DEDUPE_WINDOW: 24h
+      USSLP_UIG_DEFAULT_RATE_PER_SECOND: "2000"
+      USSLP_UIG_DEFAULT_BURST: "4000"
+      USSLP_UIG_MAX_BODY_BYTES: "16777216"
+      USSLP_UIG_BINDINGS_FILE: /etc/usslp/bindings/bindings.json
+    secrets:
+      - name: operator
+        remoteKey: uig/operator
+        mountPath: /run/secrets/uig
+        envFiles:
+          USSLP_UIG_OPERATOR_TOKEN_FILE: /run/secrets/uig/token
+      - name: bindings
+        remoteKey: uig/bindings
+        mountPath: /etc/usslp/bindings
+    storage:
+      kind: emptyDir
+      sizeLimit: 4Gi
+      mountPath: /var/lib/usslp
+    ingressPaths:
+      - path: /v1/ingest
+        pathType: Prefix
+      - path: /v1/bindings
+        pathType: Prefix
+      - path: /v1/deliveries
+        pathType: Prefix
+      - path: /v1/replay
+        pathType: Prefix
+
+  # -------------------------------------------------------------------------
+  # device-registry — identity, placement, health, planogram.
+  # -------------------------------------------------------------------------
+  device-registry:
+    enabled: true
+    kind: Deployment
+    image:
+      repository: device-registry
+    priorityClassName: usslp-platform
+    ports:
+      http: 8080
+      admin: 9090
+    replicas:
+      min: 3
+      max: 10
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+    hpa:
+      enabled: true
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+          policies:
+            - type: Percent
+              value: 50
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 600
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 180
+    pdb:
+      minAvailable: 2
+    drainTimeoutSeconds: 20
+    terminationGracePeriodSeconds: 45
+    env:
+      # This binary defaults to 127.0.0.1:8081 and 127.0.0.1:9101 in its own
+      # main.go. Both must be overridden or the pod is unreachable and
+      # unscrapeable.
+      USSLP_REGISTRY_HTTP_ADDR: "0.0.0.0:8080"
+      USSLP_REGISTRY_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_REGISTRY_DATA_DIR: /var/lib/usslp/registry
+      USSLP_EVENTLOG_DIR: /var/lib/usslp/eventlog
+      USSLP_REGISTRY_PKI_DIR: /run/secrets/pki
+      USSLP_REGISTRY_BEACON_INTERVAL: 30s
+      USSLP_REGISTRY_MISSED_BEACONS: "3"
+      USSLP_REGISTRY_SWEEP_INTERVAL: 15s
+      USSLP_SHUTDOWN_GRACE: 20s
+      # Development seeding lets the process mint device identities. Off, and
+      # it must stay off outside dev.
+      USSLP_REGISTRY_ENABLE_SEED: "false"
+    secrets:
+      - name: pki
+        remoteKey: device-registry/pki
+        mountPath: /run/secrets/pki
+        # The binary refuses to start if the loaded hierarchy carries the
+        # offline root key. The secret store must publish the intermediate
+        # hierarchy only.
+      - name: mqtt
+        remoteKey: device-registry/mqtt
+        mountPath: /run/secrets/mqtt
+        envFiles:
+          USSLP_MQTT_USERNAME_FILE: /run/secrets/mqtt/username
+          USSLP_MQTT_PASSWORD_FILE: /run/secrets/mqtt/password
+    storage:
+      kind: emptyDir
+      sizeLimit: 16Gi
+      mountPath: /var/lib/usslp
+    ingressPaths:
+      - path: /v1/devices
+        pathType: Prefix
+      - path: /v1/provision
+        pathType: Prefix
+      - path: /v1/manifests
+        pathType: Prefix
+      - path: /v1/fleet
+        pathType: Prefix
+
+  # -------------------------------------------------------------------------
+  # ota-service — firmware rollouts.
+  # -------------------------------------------------------------------------
+  ota-service:
+    enabled: true
+    kind: Deployment
+    image:
+      repository: ota-service
+    priorityClassName: usslp-platform
+    ports:
+      http: 8080
+      admin: 9090
+    replicas:
+      min: 2
+      max: 6
+    resources:
+      requests:
+        cpu: 250m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+    hpa:
+      enabled: true
+      # Queue depth. ota_downloads_in_flight is a real gauge
+      # (platform/internal/ota/app/controller.go, label: job_id); the recording
+      # rule sums it per pod for the adapter.
+      metrics:
+        - type: Pods
+          pods:
+            metric:
+              name: ota_downloads_in_flight
+            target:
+              type: AverageValue
+              averageValue: "200"
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 120
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 120
+        scaleDown:
+          # A rollout is hours long. Scaling in aggressively mid-rollout
+          # reassigns partitions and re-dispatches triggers to devices that
+          # cannot spare the mesh bandwidth.
+          stabilizationWindowSeconds: 1800
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 600
+    pdb:
+      # 1. A rollout is resumable and quiet-hours-aware; a paused rollout is a
+      # delay, not an incident, so the budget permits a full node drain to
+      # take the service down to one pod.
+      minAvailable: 1
+    drainTimeoutSeconds: 20
+    terminationGracePeriodSeconds: 45
+    env:
+      USSLP_OTA_HTTP_ADDR: "0.0.0.0:8080"
+      USSLP_OTA_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_OTA_DATA_DIR: /var/lib/usslp/ota
+      USSLP_OTA_ARTIFACT_DIR: /var/lib/usslp/firmware
+      USSLP_EVENTLOG_DIR: /var/lib/usslp/eventlog
+      USSLP_OTA_TICK_INTERVAL: 1m
+      USSLP_OTA_MAX_CONCURRENT_PER_SEC: "8"
+      USSLP_SHUTDOWN_GRACE: 20s
+    secrets:
+      - name: signing
+        remoteKey: ota-service/signing
+        mountPath: /run/secrets/ota
+        envFiles:
+          # Without this the service starts and refuses every artifact upload,
+          # which it logs at ERROR on boot.
+          USSLP_OTA_SIGNING_KEYS_FILE: /run/secrets/ota/signing-keys
+      - name: mqtt
+        remoteKey: ota-service/mqtt
+        mountPath: /run/secrets/mqtt
+        envFiles:
+          USSLP_MQTT_USERNAME_FILE: /run/secrets/mqtt/username
+          USSLP_MQTT_PASSWORD_FILE: /run/secrets/mqtt/password
+    storage:
+      kind: emptyDir
+      sizeLimit: 32Gi
+      mountPath: /var/lib/usslp
+    ingressPaths:
+      - path: /v1/ota
+        pathType: Prefix
+      - path: /v1/firmware
+        pathType: Prefix
+
+  # -------------------------------------------------------------------------
+  # mqtt-broker — EMQX. A StatefulSet, not a Deployment.
+  #
+  # Retained messages and persistent sessions are per-node state that must
+  # survive a rolling restart with a stable identity, and the Erlang
+  # distribution clusters on stable DNS names. A Deployment gives neither.
+  # -------------------------------------------------------------------------
+  mqtt-broker:
+    enabled: true
+    kind: StatefulSet
+    image:
+      # Not a USSLP binary. This is the upstream EMQX image and it is pulled
+      # from the mirrored registry, not from global.imageRegistry.
+      registry: docker.io
+      repository: emqx/emqx
+      tag: 5.7.2
+    priorityClassName: usslp-price-path
+    ports:
+      mqtt: 1883
+      mqtts: 8883
+      # EMQX's dashboard listener also serves its Prometheus endpoint at
+      # /api/v5/prometheus/stats, so one port is named `admin` and the
+      # ServiceMonitor scrapes it. Two names on one number would be a duplicate
+      # containerPort, which the API server rejects.
+      admin: 18083
+    replicas:
+      # Fixed at 5. The HPA below is disabled by default: EMQX rebalances
+      # sessions on a membership change, and an autoscaler that adds and
+      # removes nodes during a price fan-out moves the sessions the fan-out is
+      # publishing to. Enable it only with the rebalance API configured.
+      min: 5
+      max: 5
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+    hpa:
+      enabled: false
+      # Connection-based, for when it is enabled. emqx_connections_count is
+      # EMQX's own series, scraped by the emqx job.
+      metrics:
+        - type: Pods
+          pods:
+            metric:
+              name: emqx_connections_count
+            target:
+              type: AverageValue
+              averageValue: "20000"
+    pdb:
+      # 3 of 5. EMQX's session store needs a majority to rebalance safely;
+      # permitting a drain below 3 risks a split that loses persistent sessions,
+      # and a lost session is an un-acknowledged QoS 1 price update.
+      minAvailable: 3
+    drainTimeoutSeconds: 60
+    terminationGracePeriodSeconds: 120
+    env:
+      EMQX_NODE__COOKIE_FILE: /run/secrets/emqx/cookie
+      EMQX_CLUSTER__DISCOVERY_STRATEGY: k8s
+      EMQX_CLUSTER__K8S__APISERVER: "https://kubernetes.default.svc:443"
+      EMQX_CLUSTER__K8S__SERVICE_NAME: usslp-mqtt-broker-headless
+      EMQX_CLUSTER__K8S__ADDRESS_TYPE: hostname
+      EMQX_CLUSTER__K8S__SUFFIX: svc.cluster.local
+      # Retained messages are load-bearing: a controller rebooting after a
+      # power cut recovers the current price of every label in its zone from
+      # the local broker without a round trip to a cloud that may be
+      # unreachable (INTERFACE-CONTRACTS section 3).
+      EMQX_RETAINER__ENABLE: "true"
+      EMQX_RETAINER__MSG_EXPIRY_INTERVAL: "0s"
+      EMQX_MQTT__MAX_QOS_ALLOWED: "2"
+      EMQX_MQTT__SESSION_EXPIRY_INTERVAL: "2h"
+      EMQX_PROMETHEUS__ENABLE: "true"
+      EMQX_ALLOW_ANONYMOUS: "false"
+    secrets:
+      - name: emqx
+        remoteKey: mqtt-broker/emqx
+        mountPath: /run/secrets/emqx
+    storage:
+      # A real PVC. Retained messages and persistent sessions are exactly the
+      # state a StatefulSet exists to keep.
+      kind: persistentVolumeClaim
+      size: 50Gi
+      storageClassName: gp3
+      mountPath: /opt/emqx/data
+    # EMQX runs as uid 1000 in the upstream image, not 65532.
+    securityContextOverrides:
+      runAsUser: 1000
+      runAsGroup: 1000
+      # EMQX writes its Mnesia tables and its configuration cache under
+      # /opt/emqx; a read-only root filesystem would need four more emptyDirs to
+      # work around, which trades a real hardening control for a pile of mounts.
+      # It is left writable and the mount is a PVC that nothing else can reach,
+      # and the Kyverno policy in deploy/policy exempts this workload by name.
+      readOnlyRootFilesystem: false
+    podSecurityContextOverrides:
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+    probes:
+      # EMQX has no /readyz. `emqx ctl status` is the supported check and it is
+      # what the upstream chart uses.
+      exec: true
+
+  # -------------------------------------------------------------------------
+  # kafka-connect — change capture in and out of the event stream.
+  # -------------------------------------------------------------------------
+  kafka-connect:
+    enabled: true
+    kind: Deployment
+    image:
+      registry: docker.io
+      repository: confluentinc/cp-kafka-connect
+      tag: 7.6.1
+    priorityClassName: usslp-platform
+    ports:
+      # Connect serves its REST API and its metrics on one port; naming it
+      # `admin` is what lets the shared ServiceMonitor and probe helpers find
+      # it without a special case.
+      admin: 8083
+    replicas:
+      min: 3
+      max: 8
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+    hpa:
+      enabled: true
+      # Lag-based. kafka_consumer_fetch_manager_records_lag_max is Connect's own
+      # JMX series via the Prometheus JMX exporter; USSLP's own consumers report
+      # usslp_consumer_lag_records instead (obs.StandardMetrics.ConsumerLag,
+      # labels topic/group/partition).
+      metrics:
+        - type: Pods
+          pods:
+            metric:
+              name: kafka_connect_records_lag_max
+            target:
+              type: AverageValue
+              averageValue: "10000"
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 60
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 60
+        scaleDown:
+          # Every scale event triggers a Connect rebalance, which stops every
+          # task in the group. Scaling in slowly is the difference between a
+          # rebalance an hour and a rebalance a minute.
+          stabilizationWindowSeconds: 900
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 300
+    pdb:
+      minAvailable: 2
+    drainTimeoutSeconds: 60
+    terminationGracePeriodSeconds: 120
+    env:
+      CONNECT_REST_PORT: "8083"
+      CONNECT_GROUP_ID: usslp-connect
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "3"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "3"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "3"
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+    secrets:
+      - name: kafka
+        remoteKey: kafka-connect/kafka
+        mountPath: /run/secrets/kafka
+    storage:
+      kind: emptyDir
+      sizeLimit: 8Gi
+      mountPath: /tmp/connect
+    securityContextOverrides:
+      runAsUser: 1000
+      runAsGroup: 1000
+      readOnlyRootFilesystem: false
+    podSecurityContextOverrides:
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+    probes:
+      httpPath: /connectors
+      readyPath: /connectors
+
+  # -------------------------------------------------------------------------
+  # pricing-ai-service — the AI pricing tier (binary: pricing-service).
+  #
+  # As with pos-integration-gw/uig, the workload is named for what it is in the
+  # capacity table and the image is named for the binary. The metric `service`
+  # label is "pricing-service" — obs.NewRuntime takes it from the serviceName
+  # constant in platform/cmd/pricing-service/main.go — which is what every
+  # query and every canary analysis must filter on.
+  # -------------------------------------------------------------------------
+  pricing-ai-service:
+    enabled: true
+    kind: Deployment
+    image:
+      repository: pricing-service
+    priorityClassName: usslp-price-path
+    ports:
+      http: 8080
+      admin: 9090
+    replicas:
+      min: 3
+      max: 12
+    resources:
+      requests:
+        cpu: "2"
+        memory: 4Gi
+      limits:
+        cpu: "8"
+        memory: 16Gi
+    hpa:
+      enabled: true
+      # A custom metric, per the specification. usslp_pricing_tier_seconds is a
+      # real histogram (platform/internal/pricing/service.go, label: tier) whose
+      # buckets straddle the tier budgets — 10 ms for Tier 1, 15 ms for Tier 2 —
+      # because a histogram whose buckets do not bracket the SLO cannot answer
+      # whether the SLO was met.
+      #
+      # Scaling on the p99 of Tier 1 rather than on CPU is the point: inference
+      # latency degrades before CPU saturates, and by the time CPU is the signal
+      # the budget has already been missed. The recording rule that feeds this
+      # is usslp:pricing_tier1_p99 in
+      # deploy/observability/prometheus/rules/recording-rules.yaml.
+      metrics:
+        - type: Pods
+          pods:
+            metric:
+              name: usslp_pricing_tier1_p99_seconds
+            target:
+              type: AverageValue
+              # 8 ms, against a 10 ms Tier 1 budget. Scaling at the budget
+              # leaves no time to actually scale.
+              averageValue: "8m"
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 60
+        scaleDown:
+          # Slow. A model load is expensive (usslp_pricing_model_loads_total
+          # counts them) and a pod that is scaled away has to reload on the way
+          # back.
+          stabilizationWindowSeconds: 900
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 300
+    pdb:
+      minAvailable: 2
+    drainTimeoutSeconds: 30
+    terminationGracePeriodSeconds: 60
+    env:
+      USSLP_PRICING_HTTP_ADDR: "0.0.0.0:8080"
+      USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_DEFAULT_CURRENCY: USD
+      # Two years of features. The elasticity estimator needs enough price
+      # points per SKU to produce a usable confidence interval, and a retail
+      # year has one of each season in it.
+      USSLP_PRICING_FEATURE_RETENTION: 17520h
+    storage:
+      kind: emptyDir
+      sizeLimit: 32Gi
+      mountPath: /var/lib/usslp
+    ingressPaths:
+      - path: /v1/pricing
+        pathType: Prefix
+
+  # -------------------------------------------------------------------------
+  # promotion-service — promotion lifecycle and zone fan-out.
+  #
+  # NOT in the platform specification's capacity table; the sizing below is a
+  # documented parameter with a stated rationale rather than a transcription.
+  #
+  # The rationale: a promotion activation is a burst, not a rate. Activating a
+  # chain-wide promotion at midnight fans out to every zone in every store at
+  # once, and the fan-out is what the ZoneTopic shape exists to make affordable
+  # — 25 publishes per store instead of 40,000. Between bursts the service is
+  # nearly idle, which is why the floor is low and the ceiling is not.
+  # -------------------------------------------------------------------------
+  promotion-service:
+    enabled: true
+    kind: Deployment
+    image:
+      repository: promotion-service
+    priorityClassName: usslp-platform
+    ports:
+      http: 8080
+      admin: 9090
+    replicas:
+      min: 2
+      max: 10
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+    hpa:
+      enabled: true
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+      behavior:
+        scaleUp:
+          # A promotion activation is a step change, not a ramp. Scale out
+          # immediately or the burst is over before the pods arrive.
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 200
+              periodSeconds: 30
+        scaleDown:
+          stabilizationWindowSeconds: 600
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 120
+    pdb:
+      minAvailable: 1
+    drainTimeoutSeconds: 20
+    terminationGracePeriodSeconds: 45
+    env:
+      USSLP_PROMOTION_HTTP_ADDR: "0.0.0.0:8080"
+      USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_DATA_DIR: /var/lib/usslp
+      # UTC as the default, and every store overriding it. A promotion that
+      # activates "at midnight" across a chain activates at as many distinct
+      # instants as the chain has time zones, and the service is the component
+      # that has to know that.
+      USSLP_PROMOTION_DEFAULT_ZONE: UTC
+      USSLP_PROMOTION_SWEEP_INTERVAL: 30s
+    storage:
+      kind: emptyDir
+      sizeLimit: 8Gi
+      mountPath: /var/lib/usslp
+    ingressPaths:
+      - path: /v1/promotions
+        pathType: Prefix
+
+  # -------------------------------------------------------------------------
+  # api-gateway — the platform's front door.
+  #
+  # NOT in the capacity table either; sized here as a documented parameter.
+  #
+  # It fronts every other service, so its floor has to exceed the busiest thing
+  # behind it or it becomes the bottleneck: pos-integration-gw has a floor of 4,
+  # so this has a floor of 6. It is stateless, cheap per request, and entirely
+  # I/O bound, which is why the CPU limit is modest and the replica ceiling is
+  # high.
+  #
+  # TWO CONFIGURATION TRAPS, both real:
+  #
+  #   1. Its admin port defaults to :9080, not the :9090 every other USSLP
+  #      binary uses (platform/cmd/api-gateway/main.go reads ADMIN_ADDR with a
+  #      default of ":9080"). The chart pins it to 9090 below so the shared
+  #      ServiceMonitor, probes and NetworkPolicy work without a special case.
+  #
+  #   2. USSLP_UIG_ADDR here means "the UIG upstream's URL". The uig binary
+  #      reads a variable of the same name as its OWN LISTEN ADDRESS. They never
+  #      collide because each pod has its own environment — but a shared
+  #      ConfigMap across both would break one of them silently.
+  # -------------------------------------------------------------------------
+  api-gateway:
+    enabled: true
+    kind: Deployment
+    image:
+      repository: api-gateway
+    priorityClassName: usslp-price-path
+    ports:
+      http: 8080
+      admin: 9090
+    replicas:
+      min: 6
+      max: 40
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi
+    hpa:
+      enabled: true
+      metrics:
+        - type: Pods
+          pods:
+            metric:
+              name: usslp_requests_per_second
+            target:
+              type: AverageValue
+              averageValue: "800"
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 70
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 30
+            - type: Pods
+              value: 6
+              periodSeconds: 30
+          selectPolicy: Max
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 3
+              periodSeconds: 120
+    pdb:
+      # 4 of a 6-pod floor. Everything a retailer sends reaches the platform
+      # through here; a voluntary disruption may take two, never three.
+      minAvailable: 4
+    drainTimeoutSeconds: 25
+    terminationGracePeriodSeconds: 60
+    env:
+      USSLP_GATEWAY_HTTP_ADDR: "0.0.0.0:8080"
+      # Pinned, overriding the binary's own :9080 default.
+      USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_DATA_DIR: /var/lib/usslp
+      # Upstreams. These are the chart's own Service names, so they follow the
+      # release name; a rename of the release renames these too.
+      USSLP_UIG_ADDR: "http://usslp-pos-integration-gw:8080"
+      USSLP_LABEL_SERVICE_ADDR: "http://usslp-label-service:8080"
+      USSLP_DEVICE_REGISTRY_ADDR: "http://usslp-device-registry:8080"
+      USSLP_OTA_SERVICE_ADDR: "http://usslp-ota-service:8080"
+      USSLP_PRICING_SERVICE_ADDR: "http://usslp-pricing-ai-service:8080"
+      USSLP_PROMOTION_SERVICE_ADDR: "http://usslp-promotion-service:8080"
+      USSLP_ANALYTICS_SERVICE_ADDR: "http://usslp-analytics-service:8080"
+    secrets:
+      - name: jwt
+        remoteKey: api-gateway/jwt
+        mountPath: /run/secrets/jwt
+        env:
+          USSLP_JWKS_PATH: /run/secrets/jwt/jwks.json
+      - name: tls
+        remoteKey: api-gateway/tls
+        mountPath: /run/secrets/tls
+        env:
+          # Terminating TLS at the pod as well as at the ingress. Belt and
+          # braces on the path that carries every retailer's credentials.
+          USSLP_TLS_CERT_FILE: /run/secrets/tls/tls.crt
+          USSLP_TLS_KEY_FILE: /run/secrets/tls/tls.key
+    storage:
+      kind: emptyDir
+      sizeLimit: 4Gi
+      mountPath: /var/lib/usslp
+    ingressPaths:
+      - path: /
+        pathType: Prefix
+
+  # -------------------------------------------------------------------------
+  # analytics-service — the columnar store, the reports and SLO attainment.
+  #
+  # It consumes price-updates, label-delivery, label-telemetry and device-events
+  # into a column-oriented time-series store, and ages rows through hot, warm
+  # and cold tiers. The sizing below is the specification's capacity table.
+  #
+  # The memory limit is the one number here that is not a guess: a full-scan
+  # report over a month of one tenant's deliveries holds whole column blocks
+  # while it runs, which is why the limit is 8Gi against a 1Gi request. The
+  # matching WriteTimeout in the binary is 120s.
+  # -------------------------------------------------------------------------
+  analytics-service:
+    enabled: true
+    kind: Deployment
+    image:
+      repository: analytics-service
+    priorityClassName: usslp-analytics
+    ports:
+      http: 8080
+      admin: 9090
+    replicas:
+      min: 2
+      max: 8
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+    hpa:
+      enabled: true
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 80
+    pdb:
+      # 1. Analytics is replayable from the stream; the budget says so.
+      minAvailable: 1
+    drainTimeoutSeconds: 30
+    terminationGracePeriodSeconds: 60
+    env:
+      USSLP_ANALYTICS_HTTP_ADDR: "0.0.0.0:8080"
+      USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_DATA_DIR: /var/lib/usslp
+    storage:
+      kind: emptyDir
+      sizeLimit: 64Gi
+      mountPath: /var/lib/usslp
+
+# ---------------------------------------------------------------------------
+# Kafka topic provisioning
+#
+# A Helm hook Job that creates every stream in canon.AllStreams() with its real
+# partition count and retention. It runs pre-install and pre-upgrade in sync
+# wave -5 (see templates/topics-job.yaml) so that no service starts before its
+# topics exist.
+#
+# The partition counts here are transcribed from platform/pkg/canon/topics.go.
+# Changing a partition count re-maps every key to a different partition and
+# silently destroys the per-key ordering the platform is built on, which is why
+# pkg/eventlog refuses it outright (ErrPartitionsChanged) and why this job uses
+# --if-not-exists rather than --alter.
+# ---------------------------------------------------------------------------
+topicProvisioning:
+  enabled: true
+  image:
+    registry: docker.io
+    repository: bitnami/kafka
+    tag: 3.7.1
+  bootstrapServers: ""   # required when enabled; see usslp.validate
+  replicationFactor: 3
+  minInsyncReplicas: 2
+  streams:
+    - name: price-updates
+      partitions: 1024
+      retentionHours: 168
+      compacted: false
+    - name: device-events
+      partitions: 512
+      retentionHours: 720
+      compacted: false
+    - name: label-telemetry
+      partitions: 2048
+      retentionHours: 72
+      compacted: false
+    - name: inventory-sync
+      partitions: 256
+      retentionHours: 336
+      compacted: false
+    - name: promotion-events
+      partitions: 128
+      retentionHours: 2160
+      compacted: false
+    - name: audit-log
+      partitions: 64
+      retentionHours: 8760
+      compacted: false
+    - name: ota-commands
+      partitions: 128
+      retentionHours: 168
+      compacted: false
+    - name: pos-integration
+      partitions: 256
+      retentionHours: 72
+      compacted: false
+    - name: label-delivery
+      partitions: 512
+      retentionHours: 168
+      compacted: false
+    - name: dead-letter
+      partitions: 32
+      retentionHours: 336
+      compacted: false
+    - name: label-state
+      partitions: 512
+      retentionHours: 0
+      compacted: true

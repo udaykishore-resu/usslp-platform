@@ -1,0 +1,509 @@
+# USSLP — release.
+#
+# Triggered by a tag. Builds, signs, attests and publishes every image and the
+# Helm chart, then opens the door for a GitOps sync — it does not deploy
+# anything itself.
+#
+# ---------------------------------------------------------------------------
+# Why this workflow does not deploy
+# ---------------------------------------------------------------------------
+# ArgoCD deploys. The production Applications in deploy/argocd/applicationset.yaml
+# track `release-*` tags with auto-sync OFF, so a release makes an artifact
+# available and a human decides when a region takes it. A release pipeline with
+# production credentials is a release pipeline that can take down three regions
+# because a tag was pushed by mistake.
+#
+# ---------------------------------------------------------------------------
+# Signing
+# ---------------------------------------------------------------------------
+# Keyless cosign. The signing identity is *this workflow*, bound to this
+# repository and this tag, recorded in Sigstore's public transparency log —
+# there is no long-lived key to steal, and the Kyverno policy in
+# deploy/policy/kyverno/policies.yaml verifies exactly that identity at
+# admission:
+#
+#   subject: https://github.com/usslp/usslp/.github/workflows/release.yml@refs/tags/*
+#   issuer:  https://token.actions.githubusercontent.com
+#
+# If the workflow file is renamed or moved, that policy stops matching and every
+# cluster refuses every new image. That is the intended behaviour and it is why
+# the path is written into the policy rather than a wildcard.
+#
+# ---------------------------------------------------------------------------
+# The authoring environment
+# ---------------------------------------------------------------------------
+# The Go module cache was unavailable where this was written, so nothing here
+# that invokes `go` has been run. It is written for a normal runner with network
+# access.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "release-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (must already exist)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24"
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}
+
+jobs:
+  # =========================================================================
+  # Gate
+  # =========================================================================
+  verify:
+    name: Verify before releasing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.15.3
+
+      - run: pip install --disable-pip-version-check pyyaml
+
+      - name: Everything CI checks
+        # Deliberately re-run rather than trusted from the branch build. A tag
+        # can point at a commit that never had a green CI run.
+        run: |
+          make fmt-check
+          make vet
+          make test
+          make yaml-check
+          make helm-lint
+          make verify-rules
+          make verify-metrics
+          make verify-topics
+          make tf-check
+          make shell-check
+
+      - name: Derive the version
+        id: version
+        run: |
+          set -euo pipefail
+          ref="${{ inputs.tag || github.ref_name }}"
+          echo "version=${ref}" >> "$GITHUB_OUTPUT"
+          # The chart version must match the tag, or a cluster syncing
+          # `release-1.4.2` gets chart 0.1.0 and nobody can tell which chart
+          # produced which manifests.
+          chart_version=$(grep -E '^version:' deploy/helm/usslp/Chart.yaml | awk '{print $2}')
+          echo "chart version: ${chart_version}, tag: ${ref}"
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+  # =========================================================================
+  # Images
+  # =========================================================================
+  images:
+    name: Publish ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [verify]
+    permissions:
+      contents: read
+      packages: write
+      # Required for keyless cosign: the workflow exchanges this token for a
+      # short-lived Sigstore certificate.
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - api-gateway
+          - uig
+          - label-service
+          - device-registry
+          - ota-service
+          - pricing-service
+          - promotion-service
+          - analytics-service
+          - sgu
+          - sec
+          - labelsim
+        # One entry per command directory with Go source in it, kept in step
+        # with the chart's `enabled` flags and with ci.yml's matrix. The
+        # "Resolve the command path" step fails the job if an entry has no Go
+        # source, so a stale entry here breaks the release rather than shipping
+        # an empty image.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.0
+
+      - name: Resolve the command path
+        id: cmd
+        run: |
+          set -euo pipefail
+          case "${{ matrix.service }}" in
+            sgu|sec|labelsim) path="./edge/cmd/${{ matrix.service }}" ;;
+            *)                path="./platform/cmd/${{ matrix.service }}" ;;
+          esac
+          echo "path=${path}" >> "$GITHUB_OUTPUT"
+          compgen -G "${path#./}/*.go" >/dev/null || { echo "::error::${path} has no Go source"; exit 1; }
+
+      - name: Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+          # No `latest`. Both admission policies reject a mutable tag, so
+          # publishing one would produce an image nothing can run.
+          flavor: latest=false
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: runtime
+          # arm64 as well as amd64. Graviton nodes are cheaper for the
+          # analytics tier, and a Store Gateway Unit is frequently an arm64
+          # appliance.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            SERVICE=${{ matrix.service }}
+            CMD_PATH=${{ steps.cmd.outputs.path }}
+            VERSION=${{ needs.verify.outputs.version }}
+            REVISION=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=release-${{ matrix.service }}
+          cache-to: type=gha,scope=release-${{ matrix.service }},mode=max
+
+      - name: Sign the image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+        run: |
+          set -euo pipefail
+          # Sign the DIGEST, never a tag. A tag can be moved after signing; a
+          # digest cannot, which is why the Kyverno policy also sets
+          # mutateDigest so that what runs is provably what was verified.
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Generate and attest an SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom-${{ matrix.service }}.spdx.json
+
+      - name: Attach the SBOM attestation
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+        run: |
+          set -euo pipefail
+          cosign attest --yes \
+            --predicate "sbom-${{ matrix.service }}.spdx.json" \
+            --type spdxjson \
+            "${IMAGE}@${DIGEST}"
+
+      - name: Build provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify the signature we just made
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+        run: |
+          set -euo pipefail
+          # The same check the Kyverno policy performs at admission. Doing it
+          # here means a signing identity mismatch fails the release rather than
+          # failing every cluster's next sync.
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/.*$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${IMAGE}@${DIGEST}"
+
+      - name: Upload the SBOM as a release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom-${{ matrix.service }}.spdx.json
+          retention-days: 365
+
+  # =========================================================================
+  # Helm chart
+  # =========================================================================
+  chart:
+    name: Publish the Helm chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [verify, images]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.15.3
+
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.0
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Set the chart's app version to the release
+        run: |
+          set -euo pipefail
+          version="${{ needs.verify.outputs.version }}"
+          # Strip a leading v or release- so the chart carries a semver.
+          semver="${version#v}"
+          semver="${semver#release-}"
+          # The chart's own `version` moves when the templates change and is not
+          # touched here; appVersion is what pins the images.
+          sed -i "s/^appVersion:.*/appVersion: \"${semver}\"/" deploy/helm/usslp/Chart.yaml
+          grep -E '^(version|appVersion):' deploy/helm/usslp/Chart.yaml
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          helm package deploy/helm/usslp --destination /tmp/chart
+          chart=$(ls /tmp/chart/*.tgz)
+          echo "path=${chart}" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "${chart}")" >> "$GITHUB_OUTPUT"
+
+      - name: Push
+        id: push
+        run: |
+          set -euo pipefail
+          out=$(helm push "${{ steps.package.outputs.path }}" \
+            "oci://${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/charts" 2>&1 | tee /dev/stderr)
+          digest=$(echo "$out" | awk '/^Digest:/ {print $2}')
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Sign the chart
+        run: |
+          set -euo pipefail
+          # The chart is signed for the same reason the images are: a chart that
+          # can be substituted in the registry is a way to change what runs
+          # without changing an image.
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/charts/usslp@${{ steps.push.outputs.digest }}"
+
+      - name: Upload the chart
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: ${{ steps.package.outputs.path }}
+          retention-days: 365
+
+  # =========================================================================
+  # Edge artifacts
+  #
+  # The Store Gateway Unit and the Shelf Edge Controller are appliances, not
+  # pods: they are installed by deploy/edge/install.sh and updated by
+  # deploy/edge/update.sh, both of which want a plain binary and a SHA-256, not
+  # a container image.
+  # =========================================================================
+  edge-artifacts:
+    name: Edge binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [verify]
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.0
+
+      - name: Build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p dist/${{ matrix.goarch }}
+          for cmd in sgu sec labelsim; do
+            go build -trimpath -buildvcs=true -ldflags='-s -w -buildid=' \
+              -o "dist/${{ matrix.goarch }}/usslp-${cmd}" "./edge/cmd/${cmd}"
+          done
+          ls -la dist/${{ matrix.goarch }}/
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist/${{ matrix.goarch }}
+          # update.sh refuses to install a binary with no published SHA-256:
+          # there is no way to tell a corrupt download from a hostile one.
+          for f in usslp-*; do
+            sha256sum "$f" | tee "${f}.sha256"
+          done
+
+      - name: Build the update manifest
+        # This is the document deploy/edge/update.sh fetches from
+        # USSLP_UPDATE_MANIFEST_URL. Its `version` field is what pins the fleet,
+        # and clearing it centrally is how a bad rollout is stopped without
+        # touching 100,000 stores.
+        run: |
+          set -euo pipefail
+          cd dist/${{ matrix.goarch }}
+          cat > manifest.json <<EOF
+          {
+            "version": "${{ needs.verify.outputs.version }}",
+            "arch": "${{ matrix.goarch }}",
+            "revision": "${{ github.sha }}",
+            "usslp_sgu_sha256": "$(awk '{print $1}' usslp-sgu.sha256)",
+            "usslp_sec_sha256": "$(awk '{print $1}' usslp-sec.sha256)",
+            "usslp_labelsim_sha256": "$(awk '{print $1}' usslp-labelsim.sha256)"
+          }
+          EOF
+          cat manifest.json
+
+      - name: Sign the binaries
+        run: |
+          set -euo pipefail
+          cd dist/${{ matrix.goarch }}
+          for f in usslp-sgu usslp-sec usslp-labelsim manifest.json; do
+            cosign sign-blob --yes --output-signature "${f}.sig" --output-certificate "${f}.pem" "$f"
+          done
+          ls -la
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-${{ matrix.goarch }}
+          path: dist/${{ matrix.goarch }}/
+          retention-days: 365
+
+  # =========================================================================
+  # Release notes
+  # =========================================================================
+  release:
+    name: GitHub release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [verify, images, chart, edge-artifacts]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+
+      - name: Collect
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/release
+          find /tmp/artifacts -type f \
+            \( -name '*.tgz' -o -name 'usslp-*' -o -name 'manifest.json' -o -name '*.spdx.json' \) \
+            -exec cp --backup=numbered {} /tmp/release/ \;
+          ls -la /tmp/release
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: /tmp/release/*
+          generate_release_notes: true
+          body: |
+            ## USSLP ${{ needs.verify.outputs.version }}
+
+            ### Images
+            Published to `ghcr.io/${{ github.repository_owner }}/<service>:${{ needs.verify.outputs.version }}`,
+            multi-arch (amd64, arm64), each one signed keylessly with cosign and
+            carrying an SBOM attestation and build provenance.
+
+            Verify one before trusting it:
+            ```
+            cosign verify \
+              --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/.*$" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              ghcr.io/${{ github.repository_owner }}/label-service:${{ needs.verify.outputs.version }}
+            ```
+
+            ### Chart
+            `oci://ghcr.io/${{ github.repository_owner }}/charts/usslp`
+
+            ### Edge
+            `usslp-sgu`, `usslp-sec` and `usslp-labelsim` for linux/amd64 and
+            linux/arm64, with SHA-256 sums, cosign signatures, and the
+            `manifest.json` that `deploy/edge/update.sh` reads.
+
+            ### Deploying
+            This release does not deploy anything. The production ArgoCD
+            Applications track `release-*` with auto-sync off; a human syncs a
+            region, and the Argo Rollouts canary (5% → 25% → 100%, with an
+            analysis against the real SLI metrics at each step) decides whether
+            it proceeds.

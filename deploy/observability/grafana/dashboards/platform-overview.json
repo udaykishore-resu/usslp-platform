@@ -1,0 +1,394 @@
+{
+  "uid": "usslp-platform-overview",
+  "title": "USSLP — Platform Overview",
+  "description": "One screen that answers 'is the platform healthy'. Every query uses a metric registered in the Go tree; deploy/observability/verify-metrics.py checks that in CI.",
+  "tags": ["usslp", "overview"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "usslp-prometheus" }
+      },
+      {
+        "name": "region",
+        "label": "Region",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(usslp_process_uptime_seconds, region)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(usslp_process_uptime_seconds, service)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "The four numbers that matter",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Price path — % within 3s (1h)",
+      "description": "The SLO. Measured from the envelope's RecordedAt to the moment the pixels settled, because that is the only number a retailer can verify by looking at a shelf.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - usslp:sli_price_path:error_ratio1h",
+          "legendFormat": "within 3s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.98 },
+              { "color": "green", "value": 0.99 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Cloud API availability (1h)",
+      "description": "usslp_requests_total's outcome label is set from the handler's own error return, so this is the platform's verdict on the request rather than a status-code heuristic. SLO 99.95%.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "1 - usslp:sli_cloud_api:error_ratio1h", "legendFormat": "success" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 4,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.999 },
+              { "color": "green", "value": 0.9995 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "graphMode": "area", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Labels online",
+      "description": "registry_devices by lifecycle state. Online is active + degraded — a degraded label is still showing the right price. manufactured and retired are excluded: a warehouse of spares is not an outage. SLO 99.5%.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "usslp:fleet_labels:online_ratio", "legendFormat": "online" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.99 },
+              { "color": "green", "value": 0.995 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "graphMode": "area", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Stores running autonomously",
+      "description": "sgu_store_mode is 1 when a store has lost the cloud and is pricing from its own rules. One is that store's broadband. Fifty is the cloud.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "usslp:stores_autonomous:count", "legendFormat": "autonomous" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "red", "value": 50 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "graphMode": "area", "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Throughput",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "collapsed": false
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Price update decisions by outcome",
+      "description": "The closed set from platform/internal/label/app/metrics.go: applied, scheduled, rejected, stale, republished, error. `error` is infrastructure failure and is retried, so it may be counted more than once for one logical update — which is why it is not in the acceptance denominator.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(usslp_price_updates_total{region=~\"$region\"}[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "POS ingest by adapter",
+      "description": "usslp_uig_ingest_total, labelled by adapter, tenant and outcome. The tenant label carries a real cardinality cost and is kept deliberately: 'is this one retailer's integration broken or all of them' is the first question of every UIG incident.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (adapter) (rate(usslp_uig_ingest_total{region=~\"$region\"}[5m]))",
+          "legendFormat": "{{adapter}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Inbound requests by service and outcome",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service, outcome) (rate(usslp_requests_total{region=~\"$region\", service=~\"$service\"}[5m]))",
+          "legendFormat": "{{service}} / {{outcome}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean"] } }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Request latency p99 by service",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le, service) (rate(usslp_request_duration_seconds_bucket{region=~\"$region\", service=~\"$service\"}[5m])))",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Event stream",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "collapsed": false
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Consumer lag by topic and group",
+      "description": "Aggregated off the per-partition series by a recording rule — price-updates alone has 1,024 partitions. Flat handler latency with rising lag is a throughput shortfall; rising handler latency is a code problem the autoscaler will make worse.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "usslp:consumer_lag:by_topic_group",
+          "legendFormat": "{{topic}} / {{group}}"
+        },
+        {
+          "refId": "B",
+          "expr": "usslp:eventlog_lag:by_topic_group",
+          "legendFormat": "(embedded) {{topic}} / {{group}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Dead-lettered and retried events",
+      "description": "Every consumer must be idempotent and every poison message ends up in dead-letter. A rate that starts immediately after a deploy is a poison message the new code cannot handle: roll back, then triage.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (topic, reason) (rate(usslp_events_dead_lettered_total[5m]))",
+          "legendFormat": "DLQ {{topic}} ({{reason}})"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (topic) (rate(usslp_event_retries_total[5m]))",
+          "legendFormat": "retry {{topic}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] } }
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "MQTT",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "collapsed": false
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Broker connections, sessions and retained messages",
+      "description": "Retained messages are load-bearing: a controller rebooting after a power cut recovers the current price of every label in its zone from the local broker without a round trip to a cloud that may be unreachable.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+      "targets": [
+        { "refId": "A", "expr": "usslp:mqtt_broker_connections:total", "legendFormat": "connected clients" },
+        { "refId": "B", "expr": "sum(usslp_mqtt_broker_sessions)", "legendFormat": "sessions" },
+        { "refId": "C", "expr": "usslp:mqtt_broker_retained:total", "legendFormat": "retained" },
+        { "refId": "D", "expr": "sum(usslp_mqtt_broker_inflight_messages)", "legendFormat": "in flight" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last"] } }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Client link state by service",
+      "description": "1 while the link is up, 0 while it is down. The link is a readiness dependency, never a liveness one — a broker blip removes a pod from the load balancer, it does not restart it.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min by (service) (usslp_mqtt_client_connected{region=~\"$region\"})",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "max": 1,
+          "min": 0,
+          "custom": { "drawStyle": "line", "lineInterpolation": "stepAfter", "fillOpacity": 30 }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 40,
+      "type": "row",
+      "title": "Process health",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 },
+      "collapsed": true,
+      "panels": [
+        {
+          "id": 41,
+          "type": "timeseries",
+          "title": "Goroutines by service",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 42 },
+          "targets": [
+            { "refId": "A", "expr": "usslp:goroutines:by_service", "legendFormat": "{{service}}" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+        },
+        {
+          "id": 42,
+          "type": "timeseries",
+          "title": "Heap in use by service",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 42 },
+          "targets": [
+            { "refId": "A", "expr": "usslp:heap_bytes:by_service", "legendFormat": "{{service}}" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] }
+        },
+        {
+          "id": 43,
+          "type": "timeseries",
+          "title": "GC pause p99",
+          "description": "On the price path a 100 ms pause is two thirds of the MQTT publish budget.",
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 42 },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (service) (usslp_go_gc_pause_p99_seconds)",
+              "legendFormat": "{{service}}"
+            }
+          ],
+          "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+        }
+      ]
+    }
+  ]
+}

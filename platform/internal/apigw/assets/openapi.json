@@ -1,0 +1,1047 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "USSLP Platform API",
+    "version": "1.0.0",
+    "summary": "The public front door of the Universal Smart Shelf Label Platform.",
+    "description": "Every request is bound to exactly one tenant, and the tenant is derived from the credential rather than from anything in the request. An identifier belonging to another tenant is reported as `404 not_found`, never `403`: confirming that an identifier exists is itself a cross-tenant disclosure, so the API declines to distinguish 'you may not see this' from 'this does not exist'.\n\nErrors share one body: `{\"code\", \"message\", \"request_id\"}`. Quote the `request_id` in a support ticket and it joins the access log, the distributed trace and the audit record.\n\nRate limits are token buckets. `X-RateLimit-Limit` is the bucket depth, `X-RateLimit-Remaining` the tokens left, `X-RateLimit-Reset` the seconds until the bucket is full again, and `X-RateLimit-Bucket` says which of the three tiers (tenant, credential, expensive) is binding. A `429` carries `Retry-After` in seconds.\n\nRetries are safe on GET, HEAD, OPTIONS, PUT and DELETE. POST is not retried by the gateway; supply an `idempotency_key` where the schema offers one and a client-side retry becomes a no-op all the way down to the event store.",
+    "contact": { "name": "USSLP Platform Team" },
+    "license": { "name": "Proprietary", "identifier": "LicenseRef-USSLP-Commercial" }
+  },
+  "servers": [
+    { "url": "https://api.usslp.io", "description": "Production" },
+    { "url": "http://localhost:8080", "description": "Local development" }
+  ],
+  "tags": [
+    { "name": "pricing", "description": "Changing what a shelf says a product costs." },
+    { "name": "labels", "description": "The state of individual smart labels." },
+    { "name": "stores", "description": "Store health, mesh topology and planograms." },
+    { "name": "devices", "description": "The physical fleet: provisioning, retirement, quarantine." },
+    { "name": "ota", "description": "Staged firmware rollouts." },
+    { "name": "promotions", "description": "Promotion lifecycle." },
+    { "name": "analytics", "description": "Queries and reporting." },
+    { "name": "pos", "description": "POS and ERP integration state." },
+    { "name": "identity", "description": "Who you are and what credentials exist." },
+    { "name": "streaming", "description": "The live event feed." },
+    { "name": "operations", "description": "Health, documentation and the operator console." }
+  ],
+  "security": [
+    { "apiKey": [] },
+    { "bearerAuth": [] },
+    { "mutualTLS": [] }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Liveness. Answers as long as the process is scheduling goroutines.",
+        "description": "Registers no dependency checks. A broker blip must remove a replica from the load balancer, never restart it.",
+        "tags": ["operations"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The process is alive.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } }
+          },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "getReadiness",
+        "summary": "Readiness. Fails while start-up is incomplete or a dependency is unreachable.",
+        "description": "Each upstream contributes a check derived from its circuit breaker, so readiness reflects real traffic rather than a synthetic probe.",
+        "tags": ["operations"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Ready for traffic.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } }
+          },
+          "503": {
+            "description": "Not ready. The body names the failing checks.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } }
+          },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "operationId": "getOpenAPI",
+        "summary": "This document.",
+        "tags": ["operations"],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The OpenAPI 3.1 description of this API.",
+            "content": { "application/json": { "schema": { "type": "object" } } }
+          },
+          "304": { "description": "Unchanged since the ETag you presented." },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/docs": {
+      "get": {
+        "operationId": "getDocs",
+        "summary": "Human-readable API reference.",
+        "description": "A self-contained viewer rendered from /openapi.json in the browser. No external assets.",
+        "tags": ["operations"],
+        "security": [],
+        "responses": {
+          "200": { "description": "The reference page.", "content": { "text/html": { "schema": { "type": "string" } } } },
+          "304": { "description": "Unchanged since the ETag you presented." },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/console": {
+      "get": {
+        "operationId": "getConsole",
+        "summary": "The store operations console.",
+        "description": "A single embedded page: store health, a live label grid driven by /v1/stream, end-to-end latency against the 3-second SLO, error-budget burn, recent price changes with attestation status, OTA progress and POS integration health.",
+        "tags": ["operations"],
+        "security": [],
+        "responses": {
+          "200": { "description": "The console.", "content": { "text/html": { "schema": { "type": "string" } } } },
+          "304": { "description": "Unchanged since the ETag you presented." },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/me": {
+      "get": {
+        "operationId": "getMe",
+        "summary": "The calling credential: tenant, roles, store scope, expiry.",
+        "description": "Permissions are expanded from the roles so a client does not have to ship its own copy of the authorisation matrix.",
+        "tags": ["identity"],
+        "responses": {
+          "200": {
+            "description": "The authenticated principal.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Me" } } }
+          },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/keys": {
+      "get": {
+        "operationId": "listAPIKeys",
+        "summary": "The tenant's API keys. Never returns key material.",
+        "tags": ["identity"],
+        "responses": {
+          "200": {
+            "description": "The tenant's key records, newest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "keys": { "type": "array", "items": { "$ref": "#/components/schemas/ApiKey" } } },
+                  "required": ["keys"]
+                }
+              }
+            }
+          },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "operationId": "issueAPIKey",
+        "summary": "Mint an API key. The plaintext is returned once and never again.",
+        "description": "A caller may only grant roles it already holds and may only narrow, never widen, its own store scope. Keys are stored as a PBKDF2-HMAC-SHA256 verifier; the secret cannot be recovered from the platform.",
+        "tags": ["identity"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IssueKeyRequest" } } }
+        },
+        "responses": {
+          "201": {
+            "description": "The key was created. Store the `key` field now.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IssueKeyResponse" } } }
+          },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/keys/{keyId}": {
+      "delete": {
+        "operationId": "revokeAPIKey",
+        "summary": "Revoke an API key immediately.",
+        "description": "The record is retained rather than deleted, so requests made with the revoked key remain attributable during an investigation.",
+        "tags": ["identity"],
+        "parameters": [{ "$ref": "#/components/parameters/keyId" }],
+        "responses": {
+          "204": { "description": "Revoked." },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/stream": {
+      "get": {
+        "operationId": "streamEvents",
+        "summary": "WebSocket feed of platform events, filtered to the caller's tenant.",
+        "description": "An RFC 6455 upgrade. Narrow the feed with `stores` and `types`, or by sending `{\"type\":\"subscribe\",\"stores\":[…],\"types\":[…]}` on the open socket; a filter may only narrow what the credential already allows.\n\nBrowsers cannot set `Authorization` on a WebSocket, so a credential may instead be offered as the subprotocol `usslp.credential.<key>` alongside `usslp.v1`; the gateway selects `usslp.v1` and never echoes the credential.\n\nThe per-connection send queue is bounded. A consumer that falls behind is closed with `1013 Try Again Later` and should reconnect and resynchronise from the read-model endpoints rather than assume it has seen every event.",
+        "tags": ["streaming"],
+        "parameters": [
+          {
+            "name": "stores", "in": "query", "required": false,
+            "description": "Comma-separated store ids to narrow the feed to.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "types", "in": "query", "required": false,
+            "description": "Comma-separated canonical event types, e.g. `label.price.updated,device.status.offline`.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching protocols. Frames carry StreamEvent objects as JSON text.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StreamEvent" } } }
+          },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/prices": {
+      "post": {
+        "operationId": "updatePrice",
+        "summary": "Change one product's price in one store.",
+        "description": "The single-price form. It is composed by the gateway into a one-item batch against the Label Service, and returns that service's batch report unchanged, so the outcome of the one item — applied, scheduled or rejected on a business rule — is reported in full.",
+        "tags": ["pricing"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PriceChangeRequest" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "The change was applied.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BatchReport" } } }
+          },
+          "207": {
+            "description": "Partially applied. Inspect `results`.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BatchReport" } } }
+          },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/prices:batch": {
+      "post": {
+        "operationId": "batchUpdatePrices",
+        "summary": "Change many prices at once.",
+        "description": "Draws on the tighter per-tenant rate-limit bucket. A partially applied batch returns 207 with a per-label result; retrying the whole batch is safe because every applied item is idempotent.",
+        "tags": ["pricing"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BatchPriceRequest" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Every item was applied.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BatchReport" } } }
+          },
+          "207": {
+            "description": "Partially applied.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BatchReport" } } }
+          },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/labels/{labelId}/price": {
+      "post": {
+        "operationId": "updateLabelPrice",
+        "summary": "Change the price shown on one specific label.",
+        "description": "Narrows a change to a single facing rather than every label showing the product.",
+        "tags": ["pricing"],
+        "parameters": [{ "$ref": "#/components/parameters/labelId" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LabelPriceRequest" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "202": { "description": "Scheduled for a future effective time.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "422": { "description": "Refused by a pricing rule. The body says which.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/labels/{labelId}": {
+      "get": {
+        "operationId": "getLabel",
+        "summary": "One label's current state.",
+        "tags": ["labels"],
+        "parameters": [{ "$ref": "#/components/parameters/labelId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/labels/{labelId}/history": {
+      "get": {
+        "operationId": "getLabelHistory",
+        "summary": "A label's price history, newest first.",
+        "tags": ["labels"],
+        "parameters": [
+          { "$ref": "#/components/parameters/labelId" },
+          { "$ref": "#/components/parameters/limit" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/stores/{storeId}/overview": {
+      "get": {
+        "operationId": "getStoreOverview",
+        "summary": "Composed store dashboard: health, mesh, SLO and rollouts in one call.",
+        "description": "Fans out to the device registry, the Label Service and the OTA service in parallel. Sections that could not be fetched are named in `degraded` and the call still returns 200, because a console showing three of four panels during an incident is more useful than one showing an error.",
+        "tags": ["stores"],
+        "parameters": [{ "$ref": "#/components/parameters/storeId" }],
+        "responses": {
+          "200": {
+            "description": "The composed overview.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/StoreOverview" } } }
+          },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/stores/{storeId}/labels": {
+      "get": {
+        "operationId": "listStoreLabels",
+        "summary": "Every label in a store with its health.",
+        "tags": ["labels"],
+        "parameters": [{ "$ref": "#/components/parameters/storeId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/stores/{storeId}/slo": {
+      "get": {
+        "operationId": "getStoreSLO",
+        "summary": "Measured end-to-end price propagation latency against the 3s SLO.",
+        "description": "Latency is measured from the moment USSLP took durable responsibility for a change to the moment the pixels settled, which is the only number a retailer can verify by looking at a shelf.",
+        "tags": ["stores"],
+        "parameters": [{ "$ref": "#/components/parameters/storeId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/stores/{storeId}/devices": {
+      "get": {
+        "operationId": "listStoreDevices",
+        "summary": "The devices installed in a store.",
+        "tags": ["devices"],
+        "parameters": [{ "$ref": "#/components/parameters/storeId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/stores/{storeId}/mesh": {
+      "get": {
+        "operationId": "getStoreMesh",
+        "summary": "Zigbee mesh topology and predicted link risk.",
+        "tags": ["stores"],
+        "parameters": [{ "$ref": "#/components/parameters/storeId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/stores/{storeId}/health": {
+      "get": {
+        "operationId": "getStoreHealth",
+        "summary": "Labels online, battery warnings and mesh health for one store.",
+        "tags": ["stores"],
+        "parameters": [{ "$ref": "#/components/parameters/storeId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/stores/{storeId}/runway": {
+      "get": {
+        "operationId": "getStoreRunway",
+        "summary": "Projected battery runway for a store's fleet.",
+        "tags": ["stores"],
+        "parameters": [{ "$ref": "#/components/parameters/storeId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/stores/{storeId}/planogram": {
+      "get": {
+        "operationId": "getPlanogram",
+        "summary": "The store's current planogram.",
+        "tags": ["stores"],
+        "parameters": [{ "$ref": "#/components/parameters/storeId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "operationId": "uploadPlanogram",
+        "summary": "Replace a store's planogram, repositioning every affected label.",
+        "description": "An administrative operation over the whole store, so it needs `stores:admin` and draws on the expensive rate-limit bucket.",
+        "tags": ["stores"],
+        "parameters": [{ "$ref": "#/components/parameters/storeId" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "202": { "description": "Accepted; repositioning proceeds asynchronously.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/devices/{deviceId}": {
+      "get": {
+        "operationId": "getDevice",
+        "summary": "One device's registry record.",
+        "tags": ["devices"],
+        "parameters": [{ "$ref": "#/components/parameters/deviceId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/devices:provision": {
+      "post": {
+        "operationId": "provisionDevice",
+        "summary": "Provision a device and issue its certificate.",
+        "tags": ["devices"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object" } } }
+        },
+        "responses": {
+          "201": { "$ref": "#/components/responses/Document" },
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/devices/{deviceId}/retire": {
+      "post": {
+        "operationId": "retireDevice",
+        "summary": "Retire a device and revoke its certificate.",
+        "tags": ["devices"],
+        "parameters": [{ "$ref": "#/components/parameters/deviceId" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReasonRequest" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/devices/{deviceId}/quarantine": {
+      "post": {
+        "operationId": "quarantineDevice",
+        "summary": "Quarantine a suspect device.",
+        "tags": ["devices"],
+        "parameters": [{ "$ref": "#/components/parameters/deviceId" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReasonRequest" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/devices/{deviceId}/release": {
+      "post": {
+        "operationId": "releaseDevice",
+        "summary": "Release a device from quarantine.",
+        "tags": ["devices"],
+        "parameters": [{ "$ref": "#/components/parameters/deviceId" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReasonRequest" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/fleet/summary": {
+      "get": {
+        "operationId": "getFleetSummary",
+        "summary": "Fleet-wide device counts and health.",
+        "tags": ["devices"],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/ota/jobs": {
+      "get": {
+        "operationId": "listOTAJobs",
+        "summary": "Firmware rollout jobs.",
+        "tags": ["ota"],
+        "parameters": [
+          {
+            "name": "store_id", "in": "query", "required": false,
+            "description": "Restrict to rollouts touching one store.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "operationId": "createOTAJob",
+        "summary": "Start a staged firmware rollout.",
+        "description": "Rollouts advance through cohorts and honour quiet hours; creating one requires `ota:admin` because its blast radius is the tenant's whole fleet.",
+        "tags": ["ota"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object" } } }
+        },
+        "responses": {
+          "201": { "$ref": "#/components/responses/Document" },
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/ota/jobs/{jobId}": {
+      "get": {
+        "operationId": "getOTAJob",
+        "summary": "One rollout's progress.",
+        "tags": ["ota"],
+        "parameters": [{ "$ref": "#/components/parameters/jobId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/ota/jobs/{jobId}/devices": {
+      "get": {
+        "operationId": "listOTAJobDevices",
+        "summary": "Per-device outcomes within a rollout.",
+        "tags": ["ota"],
+        "parameters": [{ "$ref": "#/components/parameters/jobId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/ota/jobs/{jobId}/pause": {
+      "post": {
+        "operationId": "pauseOTAJob",
+        "summary": "Pause a rollout.",
+        "tags": ["ota"],
+        "parameters": [{ "$ref": "#/components/parameters/jobId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/ota/jobs/{jobId}/resume": {
+      "post": {
+        "operationId": "resumeOTAJob",
+        "summary": "Resume a paused rollout.",
+        "tags": ["ota"],
+        "parameters": [{ "$ref": "#/components/parameters/jobId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/ota/jobs/{jobId}/abort": {
+      "post": {
+        "operationId": "abortOTAJob",
+        "summary": "Abort a rollout.",
+        "tags": ["ota"],
+        "parameters": [{ "$ref": "#/components/parameters/jobId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/ota/jobs/{jobId}/rollback": {
+      "post": {
+        "operationId": "rollbackOTAJob",
+        "summary": "Roll a fleet back to the previous firmware.",
+        "tags": ["ota"],
+        "parameters": [{ "$ref": "#/components/parameters/jobId" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReasonRequest" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/pricing/rules": {
+      "get": {
+        "operationId": "listPricingRules",
+        "summary": "The tenant's pricing rules.",
+        "tags": ["pricing"],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "operationId": "createPricingRule",
+        "summary": "Create a pricing rule.",
+        "tags": ["pricing"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object" } } }
+        },
+        "responses": {
+          "201": { "$ref": "#/components/responses/Document" },
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/pricing/simulate": {
+      "post": {
+        "operationId": "simulatePricing",
+        "summary": "Dry-run a rule set across an estate without changing a shelf.",
+        "description": "Expensive: draws on the tighter rate-limit bucket and is allowed a long timeout.",
+        "tags": ["pricing"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/promotions": {
+      "get": {
+        "operationId": "listPromotions",
+        "summary": "The tenant's promotions.",
+        "tags": ["promotions"],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "operationId": "createPromotion",
+        "summary": "Create a promotion.",
+        "tags": ["promotions"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object" } } }
+        },
+        "responses": {
+          "201": { "$ref": "#/components/responses/Document" },
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/promotions/{promotionId}": {
+      "get": {
+        "operationId": "getPromotion",
+        "summary": "One promotion.",
+        "tags": ["promotions"],
+        "parameters": [{ "$ref": "#/components/parameters/promotionId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/promotions/{promotionId}/activate": {
+      "post": {
+        "operationId": "activatePromotion",
+        "summary": "Activate a promotion across every affected label.",
+        "description": "Expensive: one call can reprice an entire estate.",
+        "tags": ["promotions"],
+        "parameters": [{ "$ref": "#/components/parameters/promotionId" }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "202": { "description": "Accepted; activation proceeds asynchronously.", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/analytics/query": {
+      "post": {
+        "operationId": "runAnalyticsQuery",
+        "summary": "Run an analytics query over the tenant's estate.",
+        "description": "Expensive: draws on the tighter rate-limit bucket.",
+        "tags": ["analytics"],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/analytics/slo": {
+      "get": {
+        "operationId": "getAnalyticsSLO",
+        "summary": "Fleet-wide SLO attainment and error budget.",
+        "tags": ["analytics"],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/analytics/reports/{reportId}": {
+      "get": {
+        "operationId": "getAnalyticsReport",
+        "summary": "A previously generated report.",
+        "tags": ["analytics"],
+        "parameters": [{ "$ref": "#/components/parameters/reportId" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/pos/integrations": {
+      "get": {
+        "operationId": "listPOSIntegrations",
+        "summary": "Configured POS and ERP integrations.",
+        "description": "The Universal Integration Gateway scopes by tenant in the path; the gateway fills that segment from the credential, so a caller cannot name another tenant's integrations.",
+        "tags": ["pos"],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/pos/deliveries": {
+      "get": {
+        "operationId": "listPOSDeliveries",
+        "summary": "Recent inbound POS deliveries and their outcomes.",
+        "tags": ["pos"],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Document" },
+          "default": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "apiKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "A tenant-scoped API key presented as `Authorization: Bearer usslp_live_…`. The prefix is deliberate: a leaked key is findable by a secret scanner and by `git grep`."
+      },
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "An ES256 token from the platform's token service. Keys are resolved by `kid` from a published JWKS, which is what makes rotation a key-set change rather than a redeployment."
+      },
+      "mutualTLS": {
+        "type": "mutualTLS",
+        "description": "A tenant client certificate from the USSLP hierarchy. The production path for machine-to-machine traffic: nothing bearer-shaped crosses the wire, so nothing bearer-shaped can be replayed from a log."
+      }
+    },
+    "parameters": {
+      "storeId": {
+        "name": "storeId", "in": "path", "required": true,
+        "description": "A store identifier. A store outside the credential's scope is reported as 404.",
+        "schema": { "type": "string", "maxLength": 128 }
+      },
+      "labelId": {
+        "name": "labelId", "in": "path", "required": true,
+        "description": "A smart label identifier.",
+        "schema": { "type": "string", "maxLength": 128 }
+      },
+      "deviceId": {
+        "name": "deviceId", "in": "path", "required": true,
+        "description": "A device identifier: a label, a shelf edge controller or a store gateway unit.",
+        "schema": { "type": "string", "maxLength": 128 }
+      },
+      "jobId": {
+        "name": "jobId", "in": "path", "required": true,
+        "description": "A firmware rollout job identifier.",
+        "schema": { "type": "string", "maxLength": 128 }
+      },
+      "promotionId": {
+        "name": "promotionId", "in": "path", "required": true,
+        "description": "A promotion identifier.",
+        "schema": { "type": "string", "maxLength": 128 }
+      },
+      "reportId": {
+        "name": "reportId", "in": "path", "required": true,
+        "description": "An analytics report identifier.",
+        "schema": { "type": "string", "maxLength": 128 }
+      },
+      "keyId": {
+        "name": "keyId", "in": "path", "required": true,
+        "description": "The public 16-character identifier embedded in an API key.",
+        "schema": { "type": "string", "pattern": "^[0-9a-f]{16}$" }
+      },
+      "limit": {
+        "name": "limit", "in": "query", "required": false,
+        "description": "Maximum entries to return.",
+        "schema": { "type": "integer", "minimum": 1, "maximum": 1000 }
+      }
+    },
+    "responses": {
+      "Document": {
+        "description": "The upstream service's document, relayed unchanged.",
+        "content": { "application/json": { "schema": { "type": "object" } } }
+      },
+      "Error": {
+        "description": "An error. `400` invalid argument; `401` no or bad credential; `403` the credential lacks the permission; `404` no such resource, including one belonging to another tenant or outside the credential's store scope; `405` wrong method; `413` body too large; `429` rate limited, with `Retry-After`; `502`/`503`/`504` an upstream was unreachable, circuit-broken or slow.",
+        "headers": {
+          "X-Request-Id": {
+            "description": "Correlates this response with the access log, the trace and the audit record.",
+            "schema": { "type": "string" }
+          },
+          "Retry-After": {
+            "description": "Seconds to wait before retrying. Present on 429 and on a circuit-broken 503.",
+            "schema": { "type": "integer", "minimum": 1 }
+          },
+          "X-RateLimit-Limit": { "description": "Token bucket depth.", "schema": { "type": "integer" } },
+          "X-RateLimit-Remaining": { "description": "Tokens left.", "schema": { "type": "integer" } },
+          "X-RateLimit-Reset": { "description": "Seconds until the bucket is full again.", "schema": { "type": "integer" } },
+          "X-RateLimit-Bucket": { "description": "Which tier is binding: tenant, credential or expensive.", "schema": { "type": "string" } }
+        },
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string", "description": "Stable machine-readable identifier. Branch on this, not on the message." },
+          "message": { "type": "string", "description": "Human-readable explanation. 5xx messages are deliberately generic: an upstream error string leaks topology." },
+          "request_id": { "type": "string" }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "examples": ["alive", "ready", "not ready"] },
+          "checks": { "type": "object", "additionalProperties": { "type": "string" } },
+          "build": { "type": "object", "additionalProperties": { "type": "string" } }
+        }
+      },
+      "Money": {
+        "type": "object",
+        "required": ["amount", "currency"],
+        "description": "An exact amount in the currency's minor units. Never a float: a price is a legal statement and binary floating point cannot represent 1.15 exactly.",
+        "properties": {
+          "amount": { "type": "integer", "format": "int64", "description": "Minor units, e.g. 299 for £2.99." },
+          "currency": { "type": "string", "minLength": 3, "maxLength": 3, "description": "ISO 4217 code." }
+        }
+      },
+      "PriceChangeRequest": {
+        "type": "object",
+        "required": ["store_id", "price"],
+        "properties": {
+          "store_id": { "type": "string" },
+          "sku": { "type": "string", "description": "Reprices every facing of the product in the store. One of `sku` or `label_id` is required." },
+          "label_id": { "type": "string", "description": "Narrows the change to a single label." },
+          "price": { "$ref": "#/components/schemas/Money" },
+          "was_price": { "$ref": "#/components/schemas/Money" },
+          "unit_price": { "$ref": "#/components/schemas/Money" },
+          "unit_measure": { "type": "string", "examples": ["per kg", "per 100ml"] },
+          "effective_at": { "type": "string", "format": "date-time", "description": "Omit for now; a future value schedules the change rather than displaying it." },
+          "expires_at": { "type": "string", "format": "date-time" },
+          "promotion_id": { "type": "string" },
+          "reason": { "type": "string" },
+          "attributes": { "type": "object", "additionalProperties": { "type": "string" } },
+          "idempotency_key": { "type": "string", "description": "Makes a retried request a no-op down to the event store." }
+        }
+      },
+      "LabelPriceRequest": {
+        "type": "object",
+        "required": ["sku", "price"],
+        "properties": {
+          "sku": { "type": "string", "description": "Must match the label's current assignment; a mismatch is refused rather than silently repricing the wrong product." },
+          "price": { "$ref": "#/components/schemas/Money" },
+          "was_price": { "$ref": "#/components/schemas/Money" },
+          "unit_price": { "$ref": "#/components/schemas/Money" },
+          "unit_measure": { "type": "string" },
+          "effective_at": { "type": "string", "format": "date-time" },
+          "expires_at": { "type": "string", "format": "date-time" },
+          "promotion_id": { "type": "string" },
+          "reason": { "type": "string" },
+          "attributes": { "type": "object", "additionalProperties": { "type": "string" } },
+          "initiated_by": { "type": "string" },
+          "sequence": { "type": "integer", "format": "int64", "description": "When positive, asserts the per-label sequence this update must take — compare-and-set against the shelf." },
+          "idempotency_key": { "type": "string" }
+        }
+      },
+      "BatchPriceRequest": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "region": { "type": "string" },
+          "initiated_by": { "type": "string" },
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "$ref": "#/components/schemas/PriceChangeRequest" }
+          }
+        }
+      },
+      "BatchReport": {
+        "type": "object",
+        "description": "The outcome of a batch. `partial` is true when at least one label failed; retrying the whole batch is safe because every applied item is idempotent.",
+        "properties": {
+          "requested": { "type": "integer" },
+          "resolved": { "type": "integer", "description": "How many labels the items expanded to." },
+          "applied": { "type": "integer" },
+          "scheduled": { "type": "integer" },
+          "rejected": { "type": "integer" },
+          "stale": { "type": "integer" },
+          "failed": { "type": "integer" },
+          "duration_ms": { "type": "integer", "format": "int64" },
+          "partial": { "type": "boolean" },
+          "results": { "type": "array", "items": { "type": "object" } }
+        }
+      },
+      "ReasonRequest": {
+        "type": "object",
+        "properties": {
+          "reason": { "type": "string", "description": "Recorded in the audit log. Supply one: the audit trail is read by people who were not there." },
+          "initiated_by": { "type": "string" }
+        }
+      },
+      "Me": {
+        "type": "object",
+        "required": ["tenant_id", "subject", "auth_method", "roles", "permissions"],
+        "properties": {
+          "tenant_id": { "type": "string" },
+          "subject": { "type": "string" },
+          "credential_id": { "type": "string", "description": "The API key id, JWT jti or certificate serial. This is what an operator revokes." },
+          "auth_method": { "type": "string", "enum": ["api_key", "jwt", "mtls"] },
+          "roles": { "type": "array", "items": { "$ref": "#/components/schemas/Role" } },
+          "permissions": { "type": "array", "items": { "type": "string", "examples": ["prices:write"] } },
+          "stores": { "type": "array", "items": { "type": "string" }, "description": "Absent when unrestricted within the tenant." },
+          "scopes": { "type": "array", "items": { "type": "string" } },
+          "expires_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "Role": {
+        "type": "string",
+        "enum": ["owner", "store-manager", "pricing-analyst", "field-technician", "read-only", "integration"],
+        "description": "owner administers the tenant; store-manager runs stores within their scope; pricing-analyst sets prices and promotions but touches no hardware; field-technician installs and updates hardware but cannot change a price; read-only observes; integration is the machine role and can mint nothing."
+      },
+      "ApiKey": {
+        "type": "object",
+        "description": "A key record. It contains no secret — only the ability to check one someone else presents.",
+        "properties": {
+          "key_id": { "type": "string" },
+          "prefix": { "type": "string", "examples": ["usslp_live_"] },
+          "tenant_id": { "type": "string" },
+          "name": { "type": "string" },
+          "roles": { "type": "array", "items": { "$ref": "#/components/schemas/Role" } },
+          "stores": { "type": "array", "items": { "type": "string" } },
+          "scopes": { "type": "array", "items": { "type": "string" } },
+          "kdf": { "type": "string", "examples": ["pbkdf2-hmac-sha256"] },
+          "kdf_iterations": { "type": "integer" },
+          "created_by": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "expires_at": { "type": "string", "format": "date-time" },
+          "revoked_at": { "type": "string", "format": "date-time" },
+          "last_used_at": { "type": "string", "format": "date-time", "description": "Best effort. It is the field that tells you which of forty keys is safe to revoke." }
+        }
+      },
+      "IssueKeyRequest": {
+        "type": "object",
+        "required": ["name", "roles"],
+        "properties": {
+          "name": { "type": "string", "description": "Required. A key store full of keys called 'key' cannot be audited." },
+          "roles": { "type": "array", "minItems": 1, "items": { "$ref": "#/components/schemas/Role" } },
+          "stores": { "type": "array", "items": { "type": "string" }, "description": "May only narrow the issuer's own scope." },
+          "scopes": { "type": "array", "items": { "type": "string" } },
+          "ttl_seconds": { "type": "integer", "format": "int64", "description": "Defaults to 90 days, capped at one year." }
+        }
+      },
+      "IssueKeyResponse": {
+        "type": "object",
+        "required": ["key", "record"],
+        "properties": {
+          "key": { "type": "string", "description": "The plaintext credential. Shown once; hashed at rest and unrecoverable." },
+          "record": { "$ref": "#/components/schemas/ApiKey" },
+          "warning": { "type": "string" }
+        }
+      },
+      "StoreOverview": {
+        "type": "object",
+        "properties": {
+          "store_id": { "type": "string" },
+          "health": { "type": "object", "description": "The device registry's store health document." },
+          "mesh": { "type": "object", "description": "The Zigbee mesh topology document." },
+          "slo": { "type": "object", "description": "The Label Service's measured latency document." },
+          "ota": { "type": "object", "description": "Rollouts touching this store." },
+          "degraded": { "type": "array", "items": { "type": "string" }, "description": "Sections that could not be fetched. The call still returns 200." },
+          "fetched_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "StreamEvent": {
+        "type": "object",
+        "description": "One frame of the live feed. The tenant is implicit: a subscriber only ever receives its own.",
+        "properties": {
+          "type": { "type": "string", "enum": ["event", "ready", "subscribed", "error"] },
+          "event_id": { "type": "string" },
+          "event_type": { "type": "string", "examples": ["label.price.updated", "label.update.delivered", "device.status.offline", "mesh.topology.changed", "promotion.activated"] },
+          "store_id": { "type": "string" },
+          "aggregate_type": { "type": "string" },
+          "aggregate_id": { "type": "string" },
+          "occurred_at": { "type": "string", "format": "date-time", "description": "The source system's clock." },
+          "recorded_at": { "type": "string", "format": "date-time", "description": "When USSLP took durable responsibility. End-to-end latency is measured from here." },
+          "trace_id": { "type": "string" },
+          "payload": { "type": "object", "description": "The event body, passed through verbatim." }
+        }
+      }
+    }
+  }
+}

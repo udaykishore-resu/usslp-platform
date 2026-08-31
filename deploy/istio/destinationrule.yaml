@@ -1,0 +1,349 @@
+# USSLP — DestinationRules: connection pools, outlier detection, subsets.
+#
+# ---------------------------------------------------------------------------
+# What outlier detection is for, and what it is not for
+# ---------------------------------------------------------------------------
+# Outlier detection ejects an endpoint that is returning errors. It is a
+# load-balancing decision, not a health check — the pod stays Ready and stays in
+# the endpoint list, Envoy just stops sending it traffic for a while.
+#
+# That distinction is the whole reason it is here. USSLP registers dependency
+# checks on *readiness only*, deliberately, so that a broker blip removes a pod
+# from the load balancer rather than restarting it (INTERFACE-CONTRACTS
+# section 7). Outlier detection is the same philosophy one layer out: a pod
+# that has started failing is routed around, and it comes back on its own when
+# it stops failing.
+#
+# maxEjectionPercent is the number that matters. Set it to 100 and a
+# correlated failure — a bad deploy, a dependency everyone shares going down —
+# ejects every endpoint and the service is down with no endpoints at all,
+# which is strictly worse than sending traffic to pods that are struggling.
+# 50% is the ceiling everywhere below: at worst half the fleet is routed
+# around, and the other half absorbs it.
+
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: usslp-label-service
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  host: usslp-label-service.usslp.svc.cluster.local
+  trafficPolicy:
+    tls:
+      # ISTIO_MUTUAL, matching the STRICT PeerAuthentication. Stating it
+      # explicitly rather than relying on the mesh default means a change to
+      # the default cannot silently drop this service to plaintext.
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 512
+        connectTimeout: 100ms
+        # Detect a dead peer in ~21s (3 probes at 5s after 10s idle) rather
+        # than waiting for the OS default of two hours. A store-wide fan-out
+        # blocked on a half-open connection is prices not reaching shelves.
+        tcpKeepalive:
+          time: 10s
+          interval: 5s
+          probes: 3
+      http:
+        http2MaxRequests: 2048
+        maxRequestsPerConnection: 0
+        # The Label Service owns 120 ms of the 3-second budget. One retry, and
+        # only for a connection that never got established.
+        maxRetries: 1
+        # A queue is latency that has not happened yet. On the price path,
+        # failing fast and letting the caller retry against another endpoint is
+        # cheaper than queueing behind a pod that is already saturated.
+        http1MaxPendingRequests: 256
+        idleTimeout: 60s
+    outlierDetection:
+      consecutive5xxErrors: 5
+      consecutiveGatewayErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+      # Do not eject until at least half the endpoints are healthy. Without
+      # this, a deploy that briefly makes every pod return errors ejects the
+      # whole service.
+      minHealthPercent: 50
+  subsets:
+    # The canary subsets Argo Rollouts shifts traffic between. They exist here
+    # rather than in the Rollout because a DestinationRule subset that does not
+    # exist makes the VirtualService reference invalid, and a Rollout that
+    # creates them races its own traffic shift.
+    - name: stable
+      labels:
+        rollouts-pod-template-hash: stable
+    - name: canary
+      labels:
+        rollouts-pod-template-hash: canary
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: usslp-pos-integration-gw
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  host: usslp-pos-integration-gw.usslp.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 1024
+        connectTimeout: 50ms
+        tcpKeepalive:
+          time: 10s
+          interval: 5s
+          probes: 3
+      http:
+        http2MaxRequests: 4096
+        maxRequestsPerConnection: 0
+        maxRetries: 2
+        # Deliberately small. The gateway owns 50 ms of the budget and it
+        # acknowledges the caller the instant the change is durable, because a
+        # POS that is kept waiting retries — and a retry is more work for
+        # everyone than a fast 202. A deep pending queue converts that design
+        # into the thing it was built to avoid.
+        http1MaxPendingRequests: 128
+        idleTimeout: 30s
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 5s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+      minHealthPercent: 50
+  subsets:
+    - name: stable
+      labels:
+        rollouts-pod-template-hash: stable
+    - name: canary
+      labels:
+        rollouts-pod-template-hash: canary
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: usslp-device-registry
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  host: usslp-device-registry.usslp.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 256
+        connectTimeout: 250ms
+      http:
+        http2MaxRequests: 512
+        maxRetries: 2
+        http1MaxPendingRequests: 128
+        # Longer than the others: the largest legitimate request is a
+        # hypermarket's whole planogram, and the binary's own ReadTimeout is
+        # two minutes for that reason.
+        idleTimeout: 180s
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 60s
+      maxEjectionPercent: 50
+      minHealthPercent: 50
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: usslp-ota-service
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  host: usslp-ota-service.usslp.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 128
+        connectTimeout: 500ms
+      http:
+        http2MaxRequests: 256
+        # Zero retries. An OTA command is a state transition on a rollout —
+        # pause, resume, abort, rollback — and every one of them is a decision
+        # a human made once. Retrying a rollback that actually succeeded but
+        # whose response was lost is how a rollout ends up in a state nobody
+        # asked for. The API is idempotent per job, but the retry budget is
+        # not where that guarantee should be leaned on.
+        maxRetries: 0
+        http1MaxPendingRequests: 64
+        idleTimeout: 300s
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 60s
+      maxEjectionPercent: 50
+      minHealthPercent: 50
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: usslp-mqtt-broker
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  host: usslp-mqtt-broker.usslp.svc.cluster.local
+  trafficPolicy:
+    tls:
+      # DISABLE, not ISTIO_MUTUAL. The broker is not sidecar-injected: it
+      # terminates MQTT from Store Gateway Units that are appliances in a back
+      # office and will never have an Envoy. Wrapping cluster-side calls in
+      # mesh mTLS while device-side calls are not would be a false symmetry.
+      mode: DISABLE
+    connectionPool:
+      tcp:
+        # MQTT sessions are long-lived by design — CleanSession is false so the
+        # broker holds a service's subscriptions and un-acknowledged QoS 1
+        # messages across a reconnect. A pool sized for request/response would
+        # be exhausted immediately.
+        maxConnections: 4096
+        connectTimeout: 1s
+        tcpKeepalive:
+          time: 30s
+          interval: 10s
+          probes: 3
+    loadBalancer:
+      # Consistent hashing on the source IP. A reconnecting client must land
+      # back on the node holding its persistent session; round-robin would move
+      # it and lose the un-acknowledged QoS 1 messages that session was holding
+      # — each of which is a price update that never reached a shelf.
+      consistentHash:
+        useSourceIp: true
+    outlierDetection:
+      # Nothing. Ejecting a broker node moves every session it was holding,
+      # which is precisely the harm the consistent hash above exists to
+      # prevent. A broker node that is genuinely broken is removed by its
+      # readiness probe, which is the mechanism that also lets EMQX rebalance
+      # the sessions in an orderly way.
+      consecutive5xxErrors: 0
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: usslp-api-gateway
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  host: usslp-api-gateway.usslp.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        # The largest pool in the mesh: this is the front door and every
+        # retailer's traffic lands on it before it lands anywhere else.
+        maxConnections: 8192
+        connectTimeout: 100ms
+        tcpKeepalive:
+          time: 10s
+          interval: 5s
+          probes: 3
+      http:
+        http2MaxRequests: 8192
+        maxRequestsPerConnection: 0
+        maxRetries: 2
+        http1MaxPendingRequests: 512
+        # Long-lived WebSocket streams live here too
+        # (usslp_gateway_stream_connections), so the idle timeout has to exceed
+        # the gateway's own ping interval or Envoy closes a stream the gateway
+        # believes is healthy.
+        idleTimeout: 300s
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+      minHealthPercent: 50
+  subsets:
+    - name: stable
+      labels:
+        rollouts-pod-template-hash: stable
+    - name: canary
+      labels:
+        rollouts-pod-template-hash: canary
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: usslp-pricing-ai-service
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  host: usslp-pricing-ai-service.usslp.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 512
+        connectTimeout: 50ms
+      http:
+        http2MaxRequests: 2048
+        # Zero retries. The tier budgets are 10 ms and 15 ms; a retry costs more
+        # than the budget it is trying to protect, and the Label Service has its
+        # own fallback when a pricing decision does not arrive in time.
+        maxRetries: 0
+        http1MaxPendingRequests: 128
+        idleTimeout: 60s
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 5s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+      minHealthPercent: 50
+  subsets:
+    - name: stable
+      labels:
+        rollouts-pod-template-hash: stable
+    - name: canary
+      labels:
+        rollouts-pod-template-hash: canary
+---
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: usslp-promotion-service
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  host: usslp-promotion-service.usslp.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 256
+        connectTimeout: 250ms
+      http:
+        http2MaxRequests: 1024
+        maxRetries: 2
+        # Deep, unlike the price path's. A promotion activation is a burst that
+        # finishes; queueing it is better than refusing it, because a refused
+        # zone broadcast leaves that controller's labels on the old price.
+        http1MaxPendingRequests: 512
+        idleTimeout: 120s
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+      minHealthPercent: 50

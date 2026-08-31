@@ -1,0 +1,429 @@
+// Package usslp.label.v1 is the Label Service's gRPC contract.
+//
+// This file is reference material and is not compiled by the Go build: the
+// repository builds with the standard library only, and vendoring protoc-gen-go
+// would break that. It is nonetheless normative. gRPC is the production
+// transport between the API Gateway and this service, the JSON surface in
+// service.go is the same operations over HTTP, and any disagreement between the
+// two is a bug in the HTTP surface.
+//
+// Conventions:
+//
+//   - Money is always minor units plus an ISO 4217 code. Nothing in USSLP ever
+//     represents a price as a floating-point number; a shelf price that differs
+//     from the till price by one cent is a weights-and-measures violation in
+//     most of the platform's markets, so the type system forbids the
+//     representation that would make it possible.
+//   - The tenant is never a field. It is derived from the caller's mTLS client
+//     certificate by the API Gateway and forwarded in the `x-usslp-tenant`
+//     metadata key. A tenant carried in the request body would be a
+//     cross-tenant authorisation hole the moment one caller could set it.
+//   - Timestamps are google.protobuf.Timestamp in UTC. `occurred_at` is the
+//     source system's clock; `recorded_at` is when USSLP took durable
+//     responsibility. Analytics must never confuse them, which is why they are
+//     separate fields everywhere they both appear.
+//   - Field numbers are append-only. Renaming or renumbering a field breaks
+//     every Shelf Edge Controller in the field that has not yet taken an OTA.
+
+syntax = "proto3";
+
+package usslp.label.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/usslp/usslp/platform/internal/label/api;labelv1";
+
+// LabelService is the write and query surface of the Label Service.
+service LabelService {
+  // UpdatePrice applies one price change to one label.
+  //
+  // It is the operator-facing path — a colleague correcting a single shelf —
+  // not the bulk path. A price change arriving from a POS reaches the service
+  // over the `price-updates` stream instead, because at 52,000 updates per
+  // second a synchronous RPC per change would couple the POS integration's
+  // availability to this service's.
+  //
+  // Idempotent on `idempotency_key`: a retried call returns the original
+  // outcome and publishes nothing a second time.
+  rpc UpdatePrice(UpdatePriceRequest) returns (PriceResult);
+
+  // BatchUpdatePrices applies a bulk price change.
+  //
+  // This is the store-wide promotion path: one call may touch 40,000 labels.
+  // It returns a per-label report rather than a single status, because
+  // "39,998 labels were repriced and two controllers were unreachable" is the
+  // normal outcome at that scale and collapsing it into one code would be a
+  // lie in both directions.
+  //
+  // The call is rate limited per tenant. One retailer's overnight repricing
+  // must not delay another retailer's single urgent change.
+  rpc BatchUpdatePrices(BatchUpdatePricesRequest) returns (BatchUpdatePricesResponse);
+
+  // GetLabel returns one label's current state from the query-side read model.
+  rpc GetLabel(GetLabelRequest) returns (Label);
+
+  // GetLabelHistory returns a label's event-sourced price history, newest
+  // first. This is the weights-and-measures answer to "what was this shelf
+  // showing on the fourteenth, and who authorised it".
+  rpc GetLabelHistory(GetLabelHistoryRequest) returns (GetLabelHistoryResponse);
+
+  // ListStoreLabels returns a store's roster with per-label health.
+  rpc ListStoreLabels(ListStoreLabelsRequest) returns (ListStoreLabelsResponse);
+
+  // GetStoreSLO returns the measured end-to-end price propagation performance
+  // of one store: the percentiles of the only latency a retailer can verify by
+  // looking at a shelf, and the delivery success rate behind them.
+  rpc GetStoreSLO(GetStoreSLORequest) returns (StoreSLO);
+}
+
+// Money is an exact amount in the smallest indivisible unit of its currency.
+message Money {
+  // amount_minor is the value in minor units: cents for USD, yen for JPY,
+  // fils for BHD. Negative amounts are legal and represent credits.
+  int64 amount_minor = 1;
+  // currency is the ISO 4217 alphabetic code, upper case.
+  string currency = 2;
+}
+
+// RenderSpec tells the label how to draw without the cloud knowing the pixel
+// geometry of every display tier. The Shelf Edge Controller's zone rendering
+// engine turns it into a framebuffer.
+message RenderSpec {
+  // template is one of "standard", "promo", "unit_price", "clearance".
+  string template = 1;
+  // badge is the shopper-facing claim, e.g. "SALE" or "2 FOR £3". A
+  // POS-supplied badge is passed through verbatim: it is a legal claim the
+  // retailer made, and the platform is not entitled to reword it.
+  string badge = 2;
+  // led_color is "RED", "GREEN", "BLUE", "AMBER" or "OFF". The LED is a
+  // measurable drain on a seven-year cell, so it is lit only where a colleague
+  // is expected to act.
+  string led_color = 3;
+  // animation is "NONE", "PULSE_BORDER" or "FLASH".
+  string animation = 4;
+  // show_was_price draws the struck-through previous price.
+  bool show_was_price = 5;
+  // locale controls number and symbol formatting on the device.
+  string locale = 6;
+  // fields carries template-specific values: unit_price, unit_measure,
+  // was_price.
+  map<string, string> fields = 7;
+  // partial_refresh asks for a 0.3s partial E-Ink waveform instead of a 1.5s
+  // full one.
+  //
+  // The service sets it only when the digits changed and the layout did not,
+  // and it forces a full refresh periodically regardless. A partial waveform
+  // does not drive the particles fully to their rails, so residual charge
+  // accumulates and a faint image of the previous content remains. On a shelf
+  // label that ghost is a previous price, which a shopper can read — a
+  // compliance defect, not a cosmetic one.
+  bool partial_refresh = 8;
+}
+
+// Attestation is the detached signature that authorises a price.
+//
+// A label never displays a price it cannot verify. The Shelf Edge Controller
+// recomputes the digest from the update it is holding — never from the
+// transmitted digest — and checks it against the key ring it last synced.
+// A compromised controller, a corrupted mesh frame or an attacker with write
+// access to the store's broker can therefore prevent a price from changing,
+// but cannot author one.
+message Attestation {
+  // alg is always "Ed25519".
+  string alg = 1;
+  // kid identifies the price-authority key that signed.
+  string kid = 2;
+  // digest is the hex SHA-256 of the canonical price string.
+  string digest = 3;
+  // sig is the base64 raw signature.
+  string sig = 4;
+  // signed_at is when the signature was produced.
+  google.protobuf.Timestamp signed_at = 5;
+}
+
+// UpdatePriceRequest is a single-label price change.
+message UpdatePriceRequest {
+  // label_id is the label to reprice.
+  string label_id = 1;
+  // sku must match the label's current assignment. A mismatch is refused
+  // rather than silently repricing the wrong product.
+  string sku = 2;
+  // price is the new price.
+  Money price = 3;
+  // was_price is the pre-promotion price to strike through.
+  Money was_price = 4;
+  // unit_price and unit_measure drive the unit-pricing template that EU and UK
+  // law requires on the shelf edge.
+  Money unit_price = 5;
+  string unit_measure = 6;
+  // effective_at is when the price takes effect. Unset means now; a future
+  // value schedules the change rather than displaying it, and a value further
+  // in the past than the tenant's grace window is refused — a POS replaying a
+  // week-old batch must not re-price a shelf.
+  google.protobuf.Timestamp effective_at = 7;
+  // expires_at is when a promotional price lapses.
+  google.protobuf.Timestamp expires_at = 8;
+  // promotion_id, reason and attributes drive template selection.
+  string promotion_id = 9;
+  string reason = 10;
+  map<string, string> attributes = 11;
+  // initiated_by names the operator, for the audit trail.
+  string initiated_by = 12;
+  // sequence, when positive, asserts the per-label sequence this update must
+  // take; it must strictly exceed the one on the glass. Supplying it is asking
+  // for compare-and-set semantics against the shelf.
+  int64 sequence = 13;
+  // idempotency_key makes a retried call a no-op.
+  string idempotency_key = 14;
+}
+
+// Outcome is what happened to one label.
+enum Outcome {
+  // OUTCOME_UNSPECIFIED is never returned.
+  OUTCOME_UNSPECIFIED = 0;
+  // OUTCOME_APPLIED: the price reached the glass.
+  OUTCOME_APPLIED = 1;
+  // OUTCOME_SCHEDULED: accepted for a future effective time.
+  OUTCOME_SCHEDULED = 2;
+  // OUTCOME_REJECTED: refused by an invariant; see rejection_reason.
+  OUTCOME_REJECTED = 3;
+  // OUTCOME_STALE: a duplicate or out-of-order change that altered nothing.
+  OUTCOME_STALE = 4;
+  // OUTCOME_REPUBLISHED: an already-applied update whose device publish was
+  // retried after a failure.
+  OUTCOME_REPUBLISHED = 5;
+  // OUTCOME_ERROR: an infrastructure failure. Safe to retry.
+  OUTCOME_ERROR = 6;
+}
+
+// RejectionReason names the invariant that refused a price. The values are a
+// public contract: they appear in the audit log retained for the statutory
+// period and in alert rules, and are never reworded.
+enum RejectionReason {
+  REJECTION_REASON_UNSPECIFIED = 0;
+  // The price is for a product this label is not showing.
+  REJECTION_REASON_SKU_MISMATCH = 1;
+  // The price is in a currency the store does not trade in.
+  REJECTION_REASON_CURRENCY_MISMATCH = 2;
+  // effective_at is older than the tenant's grace window.
+  REJECTION_REASON_EFFECTIVE_AT_TOO_OLD = 3;
+  // effective_at is beyond the scheduling horizon.
+  REJECTION_REASON_EFFECTIVE_AT_TOO_FAR = 4;
+  // The change exceeds the tenant's maximum price movement — a fat-fingered
+  // feed pricing milk at $249.00 must not reach the glass.
+  REJECTION_REASON_GUARDRAIL_EXCEEDED = 5;
+  // The label has no SKU assignment, or is retired.
+  REJECTION_REASON_LABEL_NOT_ASSIGNED = 6;
+  // The price itself is structurally unusable.
+  REJECTION_REASON_INVALID_PRICE = 7;
+}
+
+// PriceResult is what happened to one label.
+message PriceResult {
+  string label_id = 1;
+  Outcome outcome = 2;
+  RejectionReason rejection_reason = 3;
+  // detail explains a rejection or an error in words, for a human.
+  string detail = 4;
+  // sequence is the per-label monotonic counter the update was published
+  // under. The label discards anything that does not exceed it, which is what
+  // makes at-least-once mesh delivery safe.
+  int64 sequence = 5;
+  // version is the aggregate version after the command.
+  int64 version = 6;
+  // effective_at is when the price takes or took effect.
+  google.protobuf.Timestamp effective_at = 7;
+  // attested reports that a signature travelled with the update. False on an
+  // applied update is a compliance incident.
+  bool attested = 8;
+}
+
+// BatchItem is one (store, SKU) change within a batch.
+message BatchItem {
+  string store_id = 1;
+  // sku reprices every facing of the product in the store. Set label_id
+  // instead to narrow the change to one label.
+  string sku = 2;
+  string label_id = 3;
+  Money price = 4;
+  Money was_price = 5;
+  Money unit_price = 6;
+  string unit_measure = 7;
+  google.protobuf.Timestamp effective_at = 8;
+  google.protobuf.Timestamp expires_at = 9;
+  string promotion_id = 10;
+  string reason = 11;
+  map<string, string> attributes = 12;
+  string initiated_by = 13;
+  string idempotency_key = 14;
+}
+
+// BatchUpdatePricesRequest is a bulk price change. The tenant comes from the
+// call's metadata, never from this message.
+message BatchUpdatePricesRequest {
+  string region = 1;
+  repeated BatchItem items = 2;
+  string initiated_by = 3;
+}
+
+// BatchUpdatePricesResponse is the per-label report.
+message BatchUpdatePricesResponse {
+  // requested is the number of items submitted; resolved is the number of
+  // labels they expanded to. They differ by the number of facings per product.
+  int32 requested = 1;
+  int32 resolved = 2;
+  int32 applied = 3;
+  int32 scheduled = 4;
+  int32 rejected = 5;
+  int32 stale = 6;
+  int32 failed = 7;
+  // results is one entry per label, in label-id order.
+  repeated PriceResult results = 8;
+  int64 duration_ms = 9;
+  // partial is true when at least one label failed. Retrying the whole batch
+  // is safe — every applied item is idempotent — so a caller may either retry
+  // wholesale or act on the failures alone.
+  bool partial = 10;
+}
+
+// LabelState is the lifecycle position of a label.
+enum LabelState {
+  LABEL_STATE_UNSPECIFIED = 0;
+  // Provisioned but never assigned or priced.
+  LABEL_STATE_UNPROVISIONED = 1;
+  // Assigned to a SKU, no price on the glass yet.
+  LABEL_STATE_ASSIGNED = 2;
+  // Displaying an authorised price.
+  LABEL_STATE_ACTIVE = 3;
+  // Displaying an authorised price but unreachable. The price is still valid;
+  // only the ability to change it is lost, which is why an offline label is
+  // still priced, attested and published retained.
+  LABEL_STATE_OFFLINE = 4;
+  // Permanently out of service. The stream is kept: a retired label's price
+  // history is exactly what an audit asks for.
+  LABEL_STATE_RETIRED = 5;
+}
+
+// GetLabelRequest identifies a label.
+message GetLabelRequest {
+  string label_id = 1;
+}
+
+// Label is the query-side view of one label.
+message Label {
+  string label_id = 1;
+  string store_id = 2;
+  string region = 3;
+  string sec_id = 4;
+  string sku = 5;
+  Money price = 6;
+  int64 sequence = 7;
+  LabelState state = 8;
+  string template = 9;
+  google.protobuf.Timestamp effective_at = 10;
+  string promotion_id = 11;
+  // pending_sequence is non-zero while an authorised update has not been
+  // confirmed by the label; pending_since is when it was authorised. Their gap
+  // is the outstanding half of the three-second budget.
+  int64 pending_sequence = 12;
+  google.protobuf.Timestamp pending_since = 13;
+  // last_delivered_* describe the most recent confirmed display.
+  int64 last_delivered_sequence = 14;
+  google.protobuf.Timestamp last_delivered_at = 15;
+  int64 last_latency_ms = 16;
+  // last_failure_reason is the edge's explanation of the most recent terminal
+  // delivery failure.
+  string last_failure_reason = 17;
+  int64 rejected_count = 18;
+  int32 scheduled_count = 19;
+  int64 version = 20;
+  google.protobuf.Timestamp updated_at = 21;
+  // healthy is the roster's one-glance verdict: reachable, with nothing
+  // outstanding and no recent failure.
+  bool healthy = 22;
+}
+
+// GetLabelHistoryRequest pages a label's stored events.
+message GetLabelHistoryRequest {
+  string label_id = 1;
+  // limit bounds the page, newest first. Zero means the server default.
+  int32 limit = 2;
+}
+
+// HistoryEvent is one stored event.
+message HistoryEvent {
+  int64 version = 1;
+  int64 position = 2;
+  // event_type is the canonical dotted name, e.g. "label.price.updated".
+  string event_type = 3;
+  google.protobuf.Timestamp occurred_at = 4;
+  google.protobuf.Timestamp recorded_at = 5;
+  string event_id = 6;
+  // correlation_id groups every event caused by one external request;
+  // causation_id names the event that directly caused this one. Together they
+  // reconstruct the path from a shelf back to a POS webhook.
+  string correlation_id = 7;
+  string causation_id = 8;
+  // payload_json is the event body exactly as stored. It is passed through
+  // verbatim: an audit answer that re-encodes the record is an answer about
+  // the encoder rather than about the record.
+  string payload_json = 9;
+}
+
+// GetLabelHistoryResponse is a page of history, newest first.
+message GetLabelHistoryResponse {
+  string label_id = 1;
+  repeated HistoryEvent events = 2;
+}
+
+// ListStoreLabelsRequest identifies a store.
+message ListStoreLabelsRequest {
+  string store_id = 1;
+}
+
+// ListStoreLabelsResponse is a store's roster with a health summary.
+message ListStoreLabelsResponse {
+  string store_id = 1;
+  int32 total = 2;
+  int32 healthy = 3;
+  int32 offline = 4;
+  int32 pending = 5;
+  int32 failing = 6;
+  repeated Label labels = 7;
+}
+
+// GetStoreSLORequest identifies a store.
+message GetStoreSLORequest {
+  string store_id = 1;
+}
+
+// StoreSLO is the measured end-to-end price propagation performance of one
+// store.
+//
+// The latency is measured from the moment USSLP took durable responsibility for
+// a change to the moment the pixels settled, because that is the only number a
+// retailer can verify by looking at a shelf. It is reported per replica; the
+// fleet-wide view is Prometheus aggregating the same series by store.
+message StoreSLO {
+  string store_id = 1;
+  // target_seconds is the platform's end-to-end budget: 3.0.
+  double target_seconds = 2;
+  // observations is how many confirmed deliveries the percentiles are drawn
+  // from. A percentile over a handful of observations is noise, and this is
+  // what lets a caller tell the difference.
+  uint64 observations = 3;
+  double p50_seconds = 4;
+  double p95_seconds = 5;
+  double p99_seconds = 6;
+  double mean_seconds = 7;
+  bool within_target = 8;
+  uint64 confirmed = 9;
+  uint64 failed = 10;
+  uint64 duplicate_acks = 11;
+  // delivery_success_rate is confirmed / (confirmed + failed), and is 1 when
+  // nothing has been attempted.
+  double delivery_success_rate = 12;
+  int32 labels_pending = 13;
+  int32 labels_total = 14;
+  int32 labels_offline = 15;
+}

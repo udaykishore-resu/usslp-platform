@@ -1,0 +1,370 @@
+# USSLP — OPA Gatekeeper constraint templates.
+#
+# A ConstraintTemplate defines a *check*; a Constraint (see constraints.yaml)
+# says where it applies and how hard it bites. They are split so that the same
+# check can be enforced in production and merely warned about in dev, which is
+# the only way a policy rollout does not become an outage.
+#
+# Every template below applies to pods through their controllers as well:
+# Gatekeeper's admission webhook sees the Deployment, the ReplicaSet and the Pod,
+# and rejecting at the Deployment gives the operator an error they can read
+# rather than a ReplicaSet silently failing to scale.
+
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: usslpdisallowedtags
+  annotations:
+    description: >-
+      Rejects mutable image tags. `:latest` is the obvious case; the real point
+      is that any tag a registry can move makes a cluster's state unknowable —
+      two pods of the same Deployment can be running different code, and a
+      rollback rolls back to whatever the tag points at now.
+spec:
+  crd:
+    spec:
+      names:
+        kind: USSLPDisallowedTags
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            tags:
+              type: array
+              items:
+                type: string
+            exemptImages:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package usslpdisallowedtags
+
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          not exempt(container.image)
+          tag := split(container.image, ":")[1]
+          forbidden := input.parameters.tags[_]
+          tag == forbidden
+          msg := sprintf("container <%v> uses the disallowed tag <%v>: %v", [container.name, forbidden, container.image])
+        }
+
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          not exempt(container.image)
+          not contains(container.image, ":")
+          not contains(container.image, "@sha256:")
+          msg := sprintf("container <%v> has no tag or digest, which resolves to :latest: %v", [container.name, container.image])
+        }
+
+        exempt(image) {
+          exception := input.parameters.exemptImages[_]
+          startswith(image, exception)
+        }
+
+        input_containers[c] { c := input.review.object.spec.containers[_] }
+        input_containers[c] { c := input.review.object.spec.initContainers[_] }
+        input_containers[c] { c := input.review.object.spec.template.spec.containers[_] }
+        input_containers[c] { c := input.review.object.spec.template.spec.initContainers[_] }
+---
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: usslpallowedregistries
+  annotations:
+    description: >-
+      Allow-lists the registries images may come from. This is the control that
+      stops a typo-squatted base image or a compromised public image reaching a
+      cluster that holds retail pricing data.
+spec:
+  crd:
+    spec:
+      names:
+        kind: USSLPAllowedRegistries
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            registries:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package usslpallowedregistries
+
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          not allowed(container.image)
+          msg := sprintf("container <%v> image <%v> is not from an allow-listed registry: %v",
+                         [container.name, container.image, input.parameters.registries])
+        }
+
+        allowed(image) {
+          prefix := input.parameters.registries[_]
+          startswith(image, prefix)
+        }
+
+        input_containers[c] { c := input.review.object.spec.containers[_] }
+        input_containers[c] { c := input.review.object.spec.initContainers[_] }
+        input_containers[c] { c := input.review.object.spec.template.spec.containers[_] }
+        input_containers[c] { c := input.review.object.spec.template.spec.initContainers[_] }
+---
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: usslprequiredlabels
+  annotations:
+    description: >-
+      Requires the labels the platform's own tooling selects on. Without
+      usslp.io/service and usslp.io/tier, "which workloads are on the price
+      path" is not answerable with a label selector, and the NetworkPolicies
+      and PodDisruptionBudgets that select on them silently match nothing.
+spec:
+  crd:
+    spec:
+      names:
+        kind: USSLPRequiredLabels
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            labels:
+              type: array
+              items:
+                type: object
+                properties:
+                  key:
+                    type: string
+                  allowedRegex:
+                    type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package usslprequiredlabels
+
+        violation[{"msg": msg}] {
+          required := input.parameters.labels[_]
+          provided := object_labels
+          not provided[required.key]
+          msg := sprintf("missing required label <%v> on %v/%v",
+                         [required.key, input.review.kind.kind, name])
+        }
+
+        violation[{"msg": msg}] {
+          required := input.parameters.labels[_]
+          required.allowedRegex != ""
+          value := object_labels[required.key]
+          not regex.match(required.allowedRegex, value)
+          msg := sprintf("label <%v>=<%v> does not match required pattern <%v>",
+                         [required.key, value, required.allowedRegex])
+        }
+
+        object_labels := l {
+          l := input.review.object.metadata.labels
+        }
+        object_labels := l {
+          not input.review.object.metadata.labels
+          l := {}
+        }
+
+        name := input.review.object.metadata.name
+---
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: usslpresourcelimits
+  annotations:
+    description: >-
+      Requires CPU and memory requests and limits on every container.
+      A pod with no memory limit is a pod that can take a node down and every
+      other pod on it with it — including, on a shared node, the price path.
+      A pod with no request is a pod the scheduler cannot place honestly and
+      the autoscaler cannot reason about.
+spec:
+  crd:
+    spec:
+      names:
+        kind: USSLPResourceLimits
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            required:
+              type: array
+              items:
+                type: string
+            exemptImages:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package usslpresourcelimits
+
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          not exempt(container.image)
+          resource := input.parameters.required[_]
+          not container.resources.requests[resource]
+          msg := sprintf("container <%v> has no %v request", [container.name, resource])
+        }
+
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          not exempt(container.image)
+          resource := input.parameters.required[_]
+          not container.resources.limits[resource]
+          msg := sprintf("container <%v> has no %v limit", [container.name, resource])
+        }
+
+        exempt(image) {
+          exception := input.parameters.exemptImages[_]
+          startswith(image, exception)
+        }
+
+        input_containers[c] { c := input.review.object.spec.containers[_] }
+        input_containers[c] { c := input.review.object.spec.template.spec.containers[_] }
+---
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: usslpsecuritycontext
+  annotations:
+    description: >-
+      Requires runAsNonRoot, no privilege escalation, all capabilities dropped
+      and a seccomp profile. readOnlyRootFilesystem is checked separately
+      because two third-party workloads legitimately need a writable root and
+      the exemption should be visible rather than folded into a general rule.
+spec:
+  crd:
+    spec:
+      names:
+        kind: USSLPSecurityContext
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            requireReadOnlyRoot:
+              type: boolean
+            exemptWorkloads:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package usslpsecuritycontext
+
+        violation[{"msg": msg}] {
+          not pod_runs_as_nonroot
+          container := input_containers[_]
+          not container.securityContext.runAsNonRoot
+          msg := sprintf("container <%v> does not set runAsNonRoot and neither does the pod", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          container.securityContext.allowPrivilegeEscalation != false
+          msg := sprintf("container <%v> must set allowPrivilegeEscalation: false", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          container.securityContext.privileged == true
+          msg := sprintf("container <%v> is privileged", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          container := input_containers[_]
+          not drops_all(container)
+          msg := sprintf("container <%v> must drop ALL capabilities", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          input.parameters.requireReadOnlyRoot
+          container := input_containers[_]
+          not exempt_workload
+          container.securityContext.readOnlyRootFilesystem != true
+          msg := sprintf("container <%v> must set readOnlyRootFilesystem: true", [container.name])
+        }
+
+        violation[{"msg": msg}] {
+          not seccomp_set
+          msg := "pod must set a seccompProfile of RuntimeDefault or Localhost"
+        }
+
+        drops_all(container) {
+          container.securityContext.capabilities.drop[_] == "ALL"
+        }
+
+        pod_runs_as_nonroot {
+          pod_spec.securityContext.runAsNonRoot == true
+        }
+
+        seccomp_set {
+          pod_spec.securityContext.seccompProfile.type != ""
+        }
+        seccomp_set {
+          container := input_containers[_]
+          container.securityContext.seccompProfile.type != ""
+        }
+
+        exempt_workload {
+          component := input.review.object.metadata.labels["app.kubernetes.io/component"]
+          component == input.parameters.exemptWorkloads[_]
+        }
+
+        pod_spec := s { s := input.review.object.spec.template.spec }
+        pod_spec := s {
+          not input.review.object.spec.template
+          s := input.review.object.spec
+        }
+
+        input_containers[c] { c := pod_spec.containers[_] }
+        input_containers[c] { c := pod_spec.initContainers[_] }
+---
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: usslpdataresidency
+  annotations:
+    description: >-
+      Refuses a workload whose usslp.io/region label disagrees with the
+      cluster's own region. In a residency-enforced region — eu-west-1 and
+      ap-south-1 — a pod carrying another region's label is a pod that will
+      write another region's data here, and no amount of network policy fixes a
+      workload that was pointed at the wrong place on purpose.
+spec:
+  crd:
+    spec:
+      names:
+        kind: USSLPDataResidency
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            region:
+              type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package usslpdataresidency
+
+        violation[{"msg": msg}] {
+          labels := input.review.object.metadata.labels
+          declared := labels["usslp.io/region"]
+          declared != input.parameters.region
+          msg := sprintf("workload declares usslp.io/region=<%v> but this cluster is <%v>; data residency forbids it",
+                         [declared, input.parameters.region])
+        }
+
+        violation[{"msg": msg}] {
+          not input.review.object.metadata.labels["usslp.io/region"]
+          msg := sprintf("workload has no usslp.io/region label; this cluster (<%v>) enforces data residency",
+                         [input.parameters.region])
+        }

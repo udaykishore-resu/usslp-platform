@@ -1,0 +1,1 @@
+{"group":"pricing-service.telemetry","offsets":[{"topic":"label-telemetry","partition":0,"offset":118},{"topic":"label-telemetry","partition":1,"offset":121},{"topic":"label-telemetry","partition":2,"offset":119},{"topic":"label-telemetry","partition":3,"offset":117}]}

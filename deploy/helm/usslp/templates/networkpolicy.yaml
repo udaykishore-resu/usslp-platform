@@ -1,0 +1,178 @@
+{{- if .Values.networkPolicy.enabled }}
+---
+# Default deny, both directions, for the whole namespace.
+#
+# Everything below this is an exception. Starting from deny rather than from
+# allow is what makes the exceptions auditable: the list of things that may talk
+# to the price path is exactly the list of ingress rules in this file.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "usslp.fullname" . }}-default-deny
+  labels:
+    {{- include "usslp.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# DNS. Every pod needs it and nothing works without it, so it is a namespace-wide
+# egress exception rather than repeated per service.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "usslp.fullname" . }}-allow-dns
+  labels:
+    {{- include "usslp.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dnsNamespace }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Metrics scraping. The admin port carries /metrics, /healthz and /readyz, and
+# in non-production also /debug/pprof — which is precisely why the admin port is
+# reachable only from the monitoring namespace and never from the ingress
+# controller or from another service.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "usslp.fullname" . }}-allow-scrape
+  labels:
+    {{- include "usslp.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: usslp
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        {{- range $name, $svc := .Values.services }}
+        {{- if and $svc.enabled $svc.ports.admin }}
+        - protocol: TCP
+          port: {{ $svc.ports.admin }}
+        {{- end }}
+        {{- end }}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "usslp.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "usslp.serviceLabels" (dict "ctx" $ "name" $name "svc" $svc) | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "usslp.serviceSelectorLabels" (dict "ctx" $ "name" $name) | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- if $svc.ports.http }}
+    # Business traffic: from the ingress controller, and from other USSLP pods
+    # in this namespace. Nothing else.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: usslp
+      ports:
+        - protocol: TCP
+          port: {{ $svc.ports.http }}
+    {{- end }}
+    {{- if eq $name "pos-integration-gw" }}
+    {{- with $.Values.networkPolicy.posSourceCIDRs }}
+    # Direct POS ingress. Empty by default: a retailer's POS reaches the gateway
+    # through the ingress controller like everything else, and a CIDR list here
+    # is a hole punched for a specific integration that could not.
+    - from:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $svc.ports.http }}
+    {{- end }}
+    {{- end }}
+    {{- if eq $name "mqtt-broker" }}
+    # MQTT from Store Gateway Units, which are outside the cluster and outside
+    # the mesh. The load balancer fronting this port is what the SGUs dial; the
+    # policy allows the whole cluster CIDR because the NLB preserves neither the
+    # source IP through every CNI nor a stable one across a fleet of stores.
+    # Device identity is established by mTLS at the broker, not by IP.
+    - from:
+        - podSelector: {}
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 1883
+        - protocol: TCP
+          port: 8883
+    # Erlang distribution, broker pods only.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "usslp.serviceSelectorLabels" (dict "ctx" $ "name" $name) | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 4370
+        - protocol: TCP
+          port: 5370
+    {{- end }}
+  egress:
+    # Other USSLP services in this namespace.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: usslp
+    # The Kubernetes API server, for the broker's cluster discovery. Expressed
+    # as a port rather than a CIDR because the API server's address is
+    # cluster-specific and a wrong CIDR fails closed in a way that looks like a
+    # broker bug.
+    {{- if eq $name "mqtt-broker" }}
+    - ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+    # Egress to the region's managed infrastructure — MSK, Aurora, ElastiCache,
+    # S3 — is expressed as a port list rather than a CIDR list for the same
+    # reason: the addresses come from Terraform outputs, and a chart that
+    # hard-coded them would need a release every time a subnet changed.
+    - ports:
+        - protocol: TCP
+          port: 9092    # Kafka (MSK, TLS)
+        - protocol: TCP
+          port: 9094    # Kafka (MSK, IAM auth)
+        - protocol: TCP
+          port: 5432    # PostgreSQL
+        - protocol: TCP
+          port: 6379    # Redis
+        - protocol: TCP
+          port: 8883    # MQTT over TLS
+        - protocol: TCP
+          port: 443     # S3, KMS, STS
+{{- end }}
+{{- end }}
+{{- end }}

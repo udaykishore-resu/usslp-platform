@@ -1,0 +1,722 @@
+# USSLP — prod-like profile.
+#
+# The infrastructure the platform actually targets in production, on one host:
+# Kafka in KRaft mode, EMQX, PostgreSQL 16, ClickHouse, Redis, Prometheus,
+# Grafana, Jaeger, an OpenTelemetry collector, and the USSLP services alongside
+# them.
+#
+# Run it:
+#   docker compose -f deploy/compose/docker-compose.prod-like.yml --profile all up -d
+#
+# ---------------------------------------------------------------------------
+# What is real here and what is a topology demonstration — read this
+# ---------------------------------------------------------------------------
+# REAL. The MQTT tier. platform/pkg/mqtt is a complete MQTT 3.1.1 client
+# (protocol name "MQTT", protocol level 4 — see platform/pkg/mqtt/packet.go), so
+# the Label Service, the OTA Service, the Device Registry and the Store Gateway
+# Unit talk to EMQX over the wire exactly as they would in production. The
+# retained-message behaviour the interface contract depends on, QoS 1 for prices
+# and QoS 2 for OTA triggers, session persistence across reconnects: all of that
+# is genuinely exercised against a production broker in this profile.
+#
+# A DOCUMENTED PRODUCTION TARGET, NOT YET WIRED. The event stream and the
+# stores. The services publish through pkg/eventbus.Bus and persist through the
+# repository interfaces; the implementations they are built with today are
+# pkg/eventlog (an embedded, file-backed, single-process log) and pkg/kvstore
+# (an embedded LSM store). There is no Kafka adapter and no Postgres adapter in
+# the tree yet. So in this profile:
+#
+#   - Kafka, Kafka UI and kafka-connect run, and the topic-provisioning job
+#     creates every stream in canon.AllStreams() with its real partition count
+#     and retention. Nothing in USSLP produces to them yet.
+#   - PostgreSQL 16, ClickHouse and Redis run with the schemas and databases the
+#     production port expects. Nothing in USSLP connects to them yet.
+#
+# That is deliberate and it is the honest shape of the work: the ports exist,
+# the adapters do not, and this file provisions the infrastructure those
+# adapters will be written against so the topology can be seen and measured.
+#
+# The USSLP services below therefore still carry USSLP_DATA_DIR volumes for
+# their embedded stores. When the Kafka and Postgres adapters land, the change
+# here is environment variables, not services.
+
+name: usslp-prod-like
+
+x-usslp-build: &usslp-build
+  context: ../..
+  dockerfile: deploy/docker/Dockerfile
+  target: probe
+
+x-usslp-common: &usslp-common
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 45s
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+x-usslp-env: &usslp-env
+  USSLP_ENVIRONMENT: prod
+  USSLP_REGION: us-east-1
+  USSLP_LOG_LEVEL: info
+  USSLP_LOG_FORMAT: json
+  USSLP_ENABLE_PPROF: "false"
+  USSLP_TRACE_SAMPLE_ONE_IN: "100"
+
+x-admin-healthcheck: &admin-healthcheck
+  test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "-", "http://127.0.0.1:9090/readyz"]
+  interval: 10s
+  timeout: 3s
+  retries: 6
+  start_period: 30s
+
+services:
+  # =========================================================================
+  # Event stream — Kafka in KRaft mode (no ZooKeeper)
+  # =========================================================================
+  kafka:
+    image: bitnami/kafka:3.7.1
+    profiles: ["infra", "all"]
+    restart: unless-stopped
+    environment:
+      # A single combined controller+broker node. Production is a three-node
+      # controller quorum per region (see deploy/terraform/modules/msk).
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # The platform's delivery guarantee is at-least-once with per-key
+      # ordering (INTERFACE-CONTRACTS section 2), which needs idempotent
+      # producers and acks=all. Auto-topic-creation is off because partition
+      # counts come from canon.AllStreams(), not from whoever produces first —
+      # a topic created with the wrong partition count silently destroys the
+      # per-key ordering the whole platform is built on.
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_CFG_NUM_PARTITIONS: "1"
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_CFG_MIN_INSYNC_REPLICAS: "1"
+      KAFKA_CFG_LOG_RETENTION_HOURS: "168"
+      KAFKA_HEAP_OPTS: "-Xms1g -Xmx1g"
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/bitnami/kafka
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"
+      interval: 10s
+      timeout: 10s
+      retries: 24
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 3G
+        reservations:
+          cpus: "0.5"
+          memory: 1500M
+
+  # -------------------------------------------------------------------------
+  # kafka-topics — the topic-provisioning job.
+  #
+  # Every name, partition count and retention below is transcribed from
+  # platform/pkg/canon/topics.go (canon.AllStreams()). Retentions there are in
+  # hours; Kafka wants milliseconds, so each is hours * 3_600_000.
+  #
+  # label-state has RetentionHours 0 and Compacted true: a compacted topic keeps
+  # the latest value per key forever, which is how a restarting service rebuilds
+  # its read model without replaying seven days of history. It gets
+  # cleanup.policy=compact and retention.ms=-1, never a time retention.
+  # -------------------------------------------------------------------------
+  kafka-topics:
+    image: bitnami/kafka:3.7.1
+    profiles: ["infra", "all"]
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -euo pipefail
+        BS=kafka:9092
+        create() {
+          local name=$$1 parts=$$2 retention_ms=$$3 compact=$$4
+          local cfg="--config retention.ms=$${retention_ms}"
+          if [ "$${compact}" = "yes" ]; then
+            cfg="--config cleanup.policy=compact --config retention.ms=-1 --config min.cleanable.dirty.ratio=0.1"
+          fi
+          echo "==> $${name} (partitions=$${parts})"
+          kafka-topics.sh --bootstrap-server $$BS --create --if-not-exists \
+            --topic "$${name}" --partitions "$${parts}" --replication-factor 1 $${cfg}
+        }
+        # name                partitions  retention.ms          compacted
+        create price-updates    1024       $$(( 7   * 24 * 3600000 )) no
+        create device-events     512       $$(( 30  * 24 * 3600000 )) no
+        create label-telemetry  2048       $$(( 3   * 24 * 3600000 )) no
+        create inventory-sync    256       $$(( 14  * 24 * 3600000 )) no
+        create promotion-events  128       $$(( 90  * 24 * 3600000 )) no
+        create audit-log          64       $$(( 365 * 24 * 3600000 )) no
+        create ota-commands      128       $$(( 7   * 24 * 3600000 )) no
+        create pos-integration   256       $$(( 3   * 24 * 3600000 )) no
+        create label-delivery    512       $$(( 7   * 24 * 3600000 )) no
+        create dead-letter        32       $$(( 14  * 24 * 3600000 )) no
+        create label-state       512       0                          yes
+        echo "--- provisioned ---"
+        kafka-topics.sh --bootstrap-server $$BS --list
+
+  kafka-connect:
+    image: confluentinc/cp-kafka-connect:7.6.1
+    profiles: ["infra", "all"]
+    restart: unless-stopped
+    depends_on:
+      kafka-topics:
+        condition: service_completed_successfully
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: kafka:9092
+      CONNECT_REST_ADVERTISED_HOST_NAME: kafka-connect
+      CONNECT_REST_PORT: "8083"
+      CONNECT_GROUP_ID: usslp-connect
+      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
+      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  # =========================================================================
+  # Device messaging — EMQX
+  # =========================================================================
+  emqx:
+    image: emqx/emqx:5.7.2
+    profiles: ["infra", "all"]
+    restart: unless-stopped
+    environment:
+      EMQX_NAME: usslp
+      EMQX_HOST: emqx
+      EMQX_NODE__COOKIE: ${EMQX_NODE_COOKIE:-usslp-prod-like-cookie}
+      # Retained messages are load-bearing: a controller rebooting after a power
+      # cut recovers the current price of every label in its zone from the local
+      # broker (INTERFACE-CONTRACTS section 3). They must not be disabled.
+      EMQX_RETAINER__ENABLE: "true"
+      EMQX_RETAINER__MSG_EXPIRY_INTERVAL: "0s"
+      EMQX_RETAINER__BACKEND__MAX_RETAINED_MESSAGES: "0"
+      EMQX_MQTT__MAX_QOS_ALLOWED: "2"
+      EMQX_MQTT__SESSION_EXPIRY_INTERVAL: "2h"
+      EMQX_LISTENERS__TCP__DEFAULT__MAX_CONNECTIONS: "100000"
+      # Anonymous access is on only because this is a single-host profile with
+      # no PKI. Production issues one credential per device, each scoped to
+      # usslp/{tenant}/# — see deploy/helm/usslp/templates/statefulset-mqtt.yaml
+      # and canon.SubscribeTenant.
+      EMQX_ALLOW_ANONYMOUS: "true"
+      EMQX_DASHBOARD__DEFAULT_PASSWORD: ${EMQX_DASHBOARD_PASSWORD:-usslp-change-me}
+      EMQX_PROMETHEUS__ENABLE: "true"
+    ports:
+      - "1884:1883"    # cloud MQTT (the store broker on 1883 is the SGU's)
+      - "18083:18083"  # dashboard
+    volumes:
+      - emqx-data:/opt/emqx/data
+      - emqx-log:/opt/emqx/log
+    healthcheck:
+      test: ["CMD", "/opt/emqx/bin/emqx", "ctl", "status"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+        reservations:
+          cpus: "1.0"
+          memory: 2G
+
+  # =========================================================================
+  # Relational store — PostgreSQL 16
+  #
+  # The production port for the event store and the read models. Nothing in the
+  # tree connects to it yet (see the header); the databases are created so the
+  # adapter has something to be written against.
+  # =========================================================================
+  postgres:
+    image: postgres:16.4-alpine
+    profiles: ["infra", "all"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-usslp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-usslp-change-me}
+      POSTGRES_DB: usslp
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - -c
+      - max_connections=300
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - wal_level=logical          # Debezium change capture into Kafka
+      - -c
+      - max_wal_senders=8
+      - -c
+      - max_replication_slots=8
+      - -c
+      - synchronous_commit=on      # the price path is a compliance record
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./config/postgres-init.sql:/docker-entrypoint-initdb.d/10-usslp.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-usslp} -d usslp"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  # =========================================================================
+  # Analytical store — ClickHouse
+  # =========================================================================
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    profiles: ["infra", "all"]
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: usslp
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-usslp}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-usslp-change-me}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./config/clickhouse-init.sql:/docker-entrypoint-initdb.d/10-usslp.sql:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+        reservations:
+          cpus: "1.0"
+          memory: 2G
+
+  # =========================================================================
+  # Cache — Redis
+  # =========================================================================
+  redis:
+    image: redis:7.4-alpine
+    profiles: ["infra", "all"]
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --appendonly
+      - "no"
+      # No AOF: everything Redis would hold for USSLP is a cache or a rate-limit
+      # bucket, both of which are correct to lose on a restart. The durable
+      # record is the event stream.
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1200M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  # =========================================================================
+  # Observability
+  # =========================================================================
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    profiles: ["obs", "all"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    ports:
+      - "9190:9090"
+    volumes:
+      - ./config/prometheus-prod-like.yml:/etc/prometheus/prometheus.yml:ro
+      - ../observability/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  grafana:
+    image: grafana/grafana:11.1.4
+    profiles: ["obs", "all"]
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-usslp-change-me}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_INSTALL_PLUGINS: ""
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./config/grafana-datasources.yml:/etc/grafana/provisioning/datasources/usslp.yml:ro
+      - ./config/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/usslp.yml:ro
+      - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    profiles: ["obs", "all"]
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: memory
+      MEMORY_MAX_TRACES: "100000"
+    ports:
+      - "16686:16686"  # UI
+      - "4317:4317"    # OTLP gRPC
+      - "4318:4318"    # OTLP HTTP
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:14269/"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+
+  # The collector is here for the shape of the production pipeline. USSLP's
+  # tracer currently exports through obs.LogExporter (structured log lines), not
+  # OTLP — platform/pkg/obs/runtime.go wires NewTracer with LogExporter — so the
+  # collector receives spans only from infrastructure that speaks OTLP today.
+  # The W3C trace context USSLP propagates is what makes those spans join up
+  # once an OTLP exporter is added.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.106.1
+    profiles: ["obs", "all"]
+    restart: unless-stopped
+    command: ["--config=/etc/otel/config.yaml"]
+    depends_on:
+      jaeger:
+        condition: service_started
+    ports:
+      - "4319:4317"
+      - "8889:8889"   # Prometheus exporter
+    volumes:
+      - ../observability/otel/otel-collector.yaml:/etc/otel/config.yaml:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  # =========================================================================
+  # USSLP services
+  # =========================================================================
+  uig:
+    <<: *usslp-common
+    profiles: ["usslp", "all"]
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: uig
+        CMD_PATH: ./platform/cmd/uig
+        VERSION: ${USSLP_VERSION:-prod-like}
+    image: usslp/uig:${USSLP_VERSION:-prod-like}
+    environment:
+      <<: *usslp-env
+      USSLP_UIG_ADDR: 0.0.0.0:8080
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_UIG_OPERATOR_TOKEN_FILE: /run/secrets/uig-operator-token
+      USSLP_UIG_DEDUPE_WINDOW: 24h
+      USSLP_UIG_SHUTDOWN_GRACE: 20s
+      USSLP_UIG_DEFAULT_RATE_PER_SECOND: "2000"
+      USSLP_UIG_DEFAULT_BURST: "4000"
+    secrets:
+      - uig-operator-token
+    ports:
+      - "8081:8080"
+      - "9081:9090"
+    volumes:
+      - uig-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  label-service:
+    <<: *usslp-common
+    profiles: ["usslp", "all"]
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: label-service
+        CMD_PATH: ./platform/cmd/label-service
+        VERSION: ${USSLP_VERSION:-prod-like}
+    image: usslp/label-service:${USSLP_VERSION:-prod-like}
+    depends_on:
+      emqx:
+        condition: service_healthy
+    environment:
+      <<: *usslp-env
+      USSLP_LABEL_HTTP_ADDR: 0.0.0.0:8080
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_DATA_DIR: /var/lib/usslp
+      # Real EMQX. platform/pkg/mqtt is MQTT 3.1.1 on the wire, so this hop is
+      # genuinely the production hop.
+      USSLP_MQTT_BROKER_URL: tcp://emqx:1883
+      USSLP_DEFAULT_CURRENCY: USD
+      USSLP_TENANT_RATE_PER_SECOND: "20000"
+      USSLP_TENANT_BURST: "40000"
+      USSLP_SCHEDULER_TICK: 1s
+      USSLP_SNAPSHOT_EVERY: "500"
+    ports:
+      - "8082:8080"
+      - "9082:9090"
+    volumes:
+      - label-service-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  ota-service:
+    <<: *usslp-common
+    profiles: ["usslp", "all"]
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: ota-service
+        CMD_PATH: ./platform/cmd/ota-service
+        VERSION: ${USSLP_VERSION:-prod-like}
+    image: usslp/ota-service:${USSLP_VERSION:-prod-like}
+    depends_on:
+      emqx:
+        condition: service_healthy
+    environment:
+      <<: *usslp-env
+      USSLP_OTA_HTTP_ADDR: 0.0.0.0:8080
+      USSLP_OTA_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_OTA_DATA_DIR: /var/lib/usslp/ota
+      USSLP_OTA_ARTIFACT_DIR: /var/lib/usslp/firmware
+      USSLP_EVENTLOG_DIR: /var/lib/usslp/eventlog
+      USSLP_MQTT_URL: tcp://emqx:1883
+      USSLP_MQTT_CLIENT_ID: ota-service-1
+      USSLP_OTA_TICK_INTERVAL: 1m
+      # Without USSLP_OTA_SIGNING_KEYS every artifact upload is refused, which
+      # is the binary's stated behaviour. Supply a key ring to exercise uploads.
+    ports:
+      - "8084:8080"
+      - "9084:9090"
+    volumes:
+      - ota-service-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  store-gateway:
+    <<: *usslp-common
+    profiles: ["usslp", "all"]
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: sgu
+        CMD_PATH: ./edge/cmd/sgu
+        VERSION: ${USSLP_VERSION:-prod-like}
+    image: usslp/sgu:${USSLP_VERSION:-prod-like}
+    depends_on:
+      emqx:
+        condition: service_healthy
+    environment:
+      <<: *usslp-env
+      USSLP_SGU_ID: sgu-0001
+      USSLP_STORE_ID: store-0001
+      USSLP_TENANT_ID: demo-retail
+      USSLP_BROKER_ADDR: 0.0.0.0:1883
+      USSLP_GATEWAY_ADDR: 0.0.0.0:8080
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_CLOUD_BROKER_URL: tcp://emqx:1883
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_QUEUE_MAX_ENTRIES: "50000"
+      USSLP_QUEUE_MAX_MB: "256"
+    ports:
+      - "1883:1883"
+      - "8090:8080"
+      - "9090:9090"
+    volumes:
+      - store-gateway-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  labelsim:
+    <<: *usslp-common
+    profiles: ["usslp", "all"]
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: labelsim
+        CMD_PATH: ./edge/cmd/labelsim
+        VERSION: ${USSLP_VERSION:-prod-like}
+    image: usslp/labelsim:${USSLP_VERSION:-prod-like}
+    depends_on:
+      store-gateway:
+        condition: service_healthy
+    environment:
+      <<: *usslp-env
+      USSLP_LOG_LEVEL: info
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_SIM_HTTP_ADDR: 0.0.0.0:8080
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_STORE_ID: store-0001
+      USSLP_TENANT_ID: demo-retail
+      USSLP_GATEWAY_BROKER_URL: tcp://store-gateway:1883
+      USSLP_CONTROLLERS: "25"
+      USSLP_LABELS_PER_CONTROLLER: "400"
+      USSLP_TELEMETRY_INTERVAL: 5m
+      USSLP_SIM_SPEED: "1"
+    ports:
+      - "8099:8080"
+      - "9099:9090"
+    volumes:
+      - labelsim-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+        reservations:
+          cpus: "1.0"
+          memory: 1G
+
+secrets:
+  uig-operator-token:
+    file: ./secrets/uig-operator-token
+
+volumes:
+  kafka-data:
+  emqx-data:
+  emqx-log:
+  postgres-data:
+  clickhouse-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  uig-data:
+  label-service-data:
+  ota-service-data:
+  store-gateway-data:
+  labelsim-data:

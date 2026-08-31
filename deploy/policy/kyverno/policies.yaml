@@ -1,0 +1,393 @@
+# USSLP — Kyverno policies.
+#
+# ---------------------------------------------------------------------------
+# Why both Kyverno and Gatekeeper
+# ---------------------------------------------------------------------------
+# They are not redundant, and running both is a deliberate choice rather than
+# indecision.
+#
+# Gatekeeper (deploy/policy/gatekeeper) does *validation* in Rego. Rego is
+# genuinely better at the checks that need set logic and cross-referencing —
+# "does this label match one of a list of regexes", "is this image prefixed by
+# any allow-listed registry".
+#
+# Kyverno does *mutation*, *generation* and image verification, none of which
+# Gatekeeper does at all. The policies below that matter most are the ones no
+# validating admission controller can express: verifying a cosign signature
+# before an image is admitted, and mutating a pod that is missing a security
+# context rather than merely rejecting it.
+#
+# Where both express the same rule — no `:latest`, resource limits present —
+# the duplication is intentional defence in depth: two independent admission
+# controllers with independent failure modes, and a cluster where one has been
+# accidentally disabled still refuses the image.
+
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: usslp-verify-image-signatures
+  annotations:
+    policies.kyverno.io/title: Verify USSLP image signatures
+    policies.kyverno.io/category: Supply Chain
+    policies.kyverno.io/severity: critical
+    policies.kyverno.io/description: >-
+      Every USSLP image must carry a valid keyless cosign signature produced by
+      the release workflow, bound to this repository's identity. This is the
+      control that means a registry compromise is not a cluster compromise:
+      an attacker who can push to ghcr.io/usslp cannot produce a signature
+      that Sigstore's transparency log will vouch for.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 30
+  # Fail closed. An unavailable policy engine must not become an open door.
+  failurePolicy: Fail
+  rules:
+    - name: verify-usslp-images
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["usslp"]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/usslp/*"
+          # Fail the admission rather than admitting an unsigned image with a
+          # warning.
+          required: true
+          # Rewrite the tag to the digest that was verified, so that what runs
+          # is provably what was checked. Without this, a tag could be moved
+          # between verification and pull.
+          mutateDigest: true
+          verifyDigest: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    # Keyless signing. The identity is the GitHub Actions
+                    # workflow that built the image, not a long-lived key that
+                    # can be stolen.
+                    subject: "https://github.com/usslp/usslp/.github/workflows/release.yml@refs/tags/*"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: https://rekor.sigstore.dev
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: usslp-disallow-latest-tag
+  annotations:
+    policies.kyverno.io/title: Disallow mutable image tags
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-immutable-tag
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["usslp"]
+      validate:
+        message: >-
+          An image must carry an immutable tag or a digest. `latest`, `main`,
+          `master`, `stable`, `edge` and `dev` can all be moved by whoever
+          controls the registry, which makes the cluster's state unknowable and
+          a rollback meaningless.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ regex_match('^[^:]+$', '{{ element.image }}') }}"
+                    operator: Equals
+                    value: true
+                  - key: "{{ regex_match('.*:(latest|main|master|stable|edge|dev)$', '{{ element.image }}') }}"
+                    operator: Equals
+                    value: true
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: usslp-allowed-registries
+  annotations:
+    policies.kyverno.io/title: Registry allow-list
+    policies.kyverno.io/category: Supply Chain
+    policies.kyverno.io/severity: critical
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: registry-allowlist
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["usslp"]
+      validate:
+        message: >-
+          Images may only come from ghcr.io/usslp, gcr.io/distroless, or the
+          three specific upstream images the chart deploys (emqx/emqx,
+          confluentinc/cp-kafka-connect, bitnami/kafka).
+        pattern:
+          spec:
+            =(initContainers):
+              - image: "ghcr.io/usslp/* | gcr.io/distroless/* | docker.io/emqx/emqx:* | docker.io/confluentinc/cp-kafka-connect:* | docker.io/bitnami/kafka:*"
+            containers:
+              - image: "ghcr.io/usslp/* | gcr.io/distroless/* | docker.io/emqx/emqx:* | docker.io/confluentinc/cp-kafka-connect:* | docker.io/bitnami/kafka:*"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: usslp-require-non-root
+  annotations:
+    policies.kyverno.io/title: Require non-root execution
+    policies.kyverno.io/category: Pod Security
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-run-as-non-root
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["usslp"]
+      validate:
+        message: >-
+          Containers must run as a non-root user with no privilege escalation
+          and all capabilities dropped. Every USSLP image declares
+          USER 65532:65532 and has no shell; a pod that needs root is a pod
+          running something USSLP did not build.
+        pattern:
+          spec:
+            =(securityContext):
+              =(runAsNonRoot): true
+            containers:
+              - securityContext:
+                  runAsNonRoot: true
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop: ["ALL"]
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: usslp-require-read-only-root
+  annotations:
+    policies.kyverno.io/title: Require a read-only root filesystem
+    policies.kyverno.io/category: Pod Security
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      Exempts the two third-party workloads that genuinely need a writable
+      root — EMQX writes Mnesia tables under /opt/emqx, Kafka Connect writes
+      plugin state under /tmp and /usr/share. The exemption is by component
+      label so that it is visible in a policy review rather than implied by an
+      absence.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-read-only-root
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["usslp"]
+      exclude:
+        any:
+          - resources:
+              selector:
+                matchExpressions:
+                  - key: app.kubernetes.io/component
+                    operator: In
+                    values: ["mqtt-broker", "kafka-connect", "topics"]
+      validate:
+        message: >-
+          Containers must set readOnlyRootFilesystem: true. Every USSLP service
+          that writes has an explicit emptyDir or PVC at USSLP_DATA_DIR; a
+          service that needs to write elsewhere should fail loudly at start-up
+          rather than acquire an unauditable writable layer.
+        pattern:
+          spec:
+            containers:
+              - securityContext:
+                  readOnlyRootFilesystem: true
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: usslp-require-resources
+  annotations:
+    policies.kyverno.io/title: Require resource requests and limits
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-requests-and-limits
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["usslp"]
+      validate:
+        message: >-
+          Every container needs CPU and memory requests and a memory limit.
+          A pod with no memory limit can take a node down and every pod on it
+          with it — on a shared node that includes the price path. A pod with
+          no request is one the scheduler cannot place honestly.
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  requests:
+                    cpu: "?*"
+                    memory: "?*"
+                  limits:
+                    cpu: "?*"
+                    memory: "?*"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: usslp-require-labels
+  annotations:
+    policies.kyverno.io/title: Require platform labels
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-platform-labels
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment", "StatefulSet"]
+              namespaces: ["usslp"]
+      validate:
+        message: >-
+          usslp.io/service, usslp.io/tier, usslp.io/region and
+          usslp.io/environment are required. The NetworkPolicies and
+          PodDisruptionBudgets select on them; a workload without them is one
+          those objects silently do not cover.
+        pattern:
+          metadata:
+            labels:
+              app.kubernetes.io/name: "?*"
+              app.kubernetes.io/component: "?*"
+              app.kubernetes.io/part-of: "usslp"
+              usslp.io/service: "?*"
+              usslp.io/tier: "price-path | platform | analytics"
+              usslp.io/region: "?*"
+              usslp.io/environment: "dev | staging | prod"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: usslp-add-default-security-context
+  annotations:
+    policies.kyverno.io/title: Mutate a missing security context into place
+    policies.kyverno.io/category: Pod Security
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      The one thing a validating controller cannot do. A pod arriving without a
+      seccomp profile is fixed rather than rejected, which matters for the
+      objects USSLP does not template — a debug pod, a Job created by an
+      operator — where rejection would just mean someone disables the policy.
+      Anything the chart produces already sets all of this, so this rule is a
+      no-op on the platform's own workloads.
+spec:
+  # Mutation only; nothing here can reject anything.
+  background: false
+  rules:
+    - name: add-seccomp-profile
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["usslp"]
+      mutate:
+        patchStrategicMerge:
+          spec:
+            # +(...) sets the value only if the key is absent.
+            +(securityContext):
+              seccompProfile:
+                type: RuntimeDefault
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: usslp-disallow-host-namespaces
+  annotations:
+    policies.kyverno.io/title: Disallow host namespaces and host paths
+    policies.kyverno.io/category: Pod Security
+    policies.kyverno.io/severity: critical
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: disallow-host-namespaces
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["usslp"]
+      validate:
+        message: >-
+          hostNetwork, hostPID, hostIPC and hostPath are all escapes from the
+          isolation the rest of these policies depend on. Nothing USSLP runs in
+          the cloud tier needs any of them — the edge tier, which genuinely does
+          touch hardware, runs on systemd and K3s outside this namespace.
+        pattern:
+          spec:
+            =(hostNetwork): false
+            =(hostPID): false
+            =(hostIPC): false
+            =(volumes):
+              - X(hostPath): "null"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: usslp-require-pdb-and-probes
+  annotations:
+    policies.kyverno.io/title: Require readiness and liveness probes
+    policies.kyverno.io/category: Reliability
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      A workload with no readiness probe receives traffic the moment its
+      container starts, which for a USSLP service means before it has finished
+      rebuilding its read model. obs.Health fails readiness until start-up
+      completes precisely so that cannot happen; a Deployment without the probe
+      throws that away.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-probes
+      match:
+        any:
+          - resources:
+              kinds: ["Deployment", "StatefulSet"]
+              namespaces: ["usslp"]
+      validate:
+        message: >-
+          Every container needs both a readinessProbe and a livenessProbe.
+          Readiness gates traffic; liveness restarts a wedged process. USSLP
+          registers dependency checks on readiness only, so the two are not
+          interchangeable.
+        pattern:
+          spec:
+            template:
+              spec:
+                containers:
+                  - readinessProbe:
+                      ^(periodSeconds): ">0"
+                    livenessProbe:
+                      ^(periodSeconds): ">0"

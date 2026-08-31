@@ -1,0 +1,48 @@
+# BuildKit reads <dockerfile-path>.dockerignore in preference to the context
+# root's .dockerignore, which is what lets this file live beside the Dockerfile
+# it belongs to while the build context stays the repository root.
+#
+# Requires DOCKER_BUILDKIT=1 (or docker buildx). build.sh sets it.
+
+# Version control and CI metadata: never needed to compile a Go binary, and
+# .git in particular is the single largest thing in a normal checkout.
+.git
+.github
+.gitignore
+.gitattributes
+
+# The deployment layer builds the images; it is never inside one.
+deploy
+
+# Documentation.
+docs
+**/*.md
+LICENSE
+
+# Local build output and state. data/ is where every service's kvstore and
+# event log land when run outside a container; shipping a developer's event log
+# into an image would be both large and a data leak.
+bin
+dist
+data
+**/data
+*.out
+*.test
+coverage*
+
+# Editor and OS noise.
+.idea
+.vscode
+.DS_Store
+*.swp
+
+# Anything that could carry a credential. The build never needs one, and an
+# accidental commit of a key must not become an accidental push of an image
+# containing it.
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+!deploy/compose/.env.example

@@ -1,0 +1,447 @@
+# USSLP — recording rules.
+#
+# CANONICAL SOURCE. deploy/helm/usslp/files/rules/ holds a generated copy that
+# the chart's PrometheusRule template embeds; `make helm-sync-rules` regenerates
+# it and `make verify-rules` fails if the two have drifted. Edit this file.
+#
+# ---------------------------------------------------------------------------
+# Every metric name below is registered somewhere in the Go tree. Nothing here
+# is invented. The registration sites are:
+#
+#   usslp_price_update_e2e_seconds     platform/internal/label/app/metrics.go
+#   usslp_price_updates_total          platform/internal/label/app/metrics.go
+#   usslp_label_delivery_confirmations_total   ditto
+#   usslp_labels_pending_delivery      ditto
+#   usslp_attestation_failures_total   ditto
+#   usslp_device_publish_duration_seconds      ditto
+#   usslp_price_fanout_duration_seconds        ditto
+#   usslp_uig_ingest_duration_seconds  platform/internal/uig/pipeline/metrics.go
+#   usslp_uig_ingest_total             ditto
+#   usslp_uig_*                        ditto
+#   usslp_requests_total               platform/pkg/obs/runtime.go (StandardMetrics)
+#   usslp_request_duration_seconds     ditto
+#   usslp_consumer_lag_records         ditto
+#   usslp_process_uptime_seconds       platform/pkg/obs/runtime.go (runtime collector)
+#   usslp_mqtt_client_connected        platform/pkg/mqtt/metrics.go
+#   usslp_mqtt_broker_*                ditto
+#   ota_device_outcomes_total          platform/internal/ota/app/controller.go
+#   ota_downloads_in_flight            ditto
+#   registry_devices                   platform/internal/registry/app/service.go
+#   sgu_store_mode, sgu_upstream_queue, sgu_bridged_total   edge/sgu/gateway.go
+#   sec_compliance_alerts_total, sec_updates_total          edge/sec/controller.go
+#   sec_label_delivery_seconds                              edge/sec/coordinator.go
+#   eventlog_consumer_lag_records      platform/pkg/eventlog/metrics.go
+#   usslp_gateway_*                    platform/internal/apigw/metrics.go
+#   usslp_pricing_*                    platform/internal/pricing/service.go
+#   usslp_promotion_*                  platform/internal/promotion/service.go
+#
+# Label values are equally real: DeliveryConfirmed/"confirmed",
+# DeliveryFailed/"failed", DeliveryDuplicate/"duplicate",
+# DeliveryUnknown/"unknown_label" (platform/internal/label/app/delivery.go);
+# the OTA DeviceStatus set (platform/internal/ota/domain/job.go); the registry
+# DeviceState set (platform/internal/registry/domain/device.go).
+#
+# ---------------------------------------------------------------------------
+# Bucket boundaries
+#
+# le="3" exists because 3 is in obs.LatencyBuckets (platform/pkg/obs/metrics.go)
+# and the exposition renders it with strconv.FormatFloat(f, 'g', -1, 64) — so
+# the label value is exactly "3", not "3.0".
+#
+# le="0.5" exists because 0.5 is in pipeline.IngestBuckets, which is a
+# UIG-specific bucket set chosen because obs.LatencyBuckets jumps 0.025 → 0.05
+# → 0.1 and cannot distinguish a gateway at half its 50 ms budget from one at
+# its limit.
+# ---------------------------------------------------------------------------
+
+groups:
+
+  # =========================================================================
+  # SLI error ratios
+  #
+  # One recording rule per SLO per window. The alert rules divide these by the
+  # error budget to get a burn rate, so the rules below are the only place a
+  # ratio is defined and the alerts stay readable.
+  #
+  # Rate windows: 5m and 30m for the fast burn detectors, 1h/2h/6h/1d/3d for
+  # the slow ones. The short window in each pair exists to make the alert
+  # *stop* firing quickly once the burn does; without it a 1h-window alert
+  # keeps paging for an hour after the incident is over.
+  # =========================================================================
+  - name: usslp.sli.price-path
+    interval: 30s
+    rules:
+      # SLO: 99% of price updates reach the glass within 3 seconds.
+      # "The glass" is not a figure of speech: LatencyMS is measured from the
+      # envelope's RecordedAt to the moment the pixels settled, because that is
+      # the only number a retailer can verify by looking at a shelf.
+      - record: usslp:sli_price_path:error_ratio5m
+        expr: |
+          1 - (
+            sum(rate(usslp_price_update_e2e_seconds_bucket{le="3"}[5m]))
+            /
+            sum(rate(usslp_price_update_e2e_seconds_count[5m]))
+          )
+      - record: usslp:sli_price_path:error_ratio30m
+        expr: |
+          1 - (
+            sum(rate(usslp_price_update_e2e_seconds_bucket{le="3"}[30m]))
+            /
+            sum(rate(usslp_price_update_e2e_seconds_count[30m]))
+          )
+      - record: usslp:sli_price_path:error_ratio1h
+        expr: |
+          1 - (
+            sum(rate(usslp_price_update_e2e_seconds_bucket{le="3"}[1h]))
+            /
+            sum(rate(usslp_price_update_e2e_seconds_count[1h]))
+          )
+      - record: usslp:sli_price_path:error_ratio2h
+        expr: |
+          1 - (
+            sum(rate(usslp_price_update_e2e_seconds_bucket{le="3"}[2h]))
+            /
+            sum(rate(usslp_price_update_e2e_seconds_count[2h]))
+          )
+      - record: usslp:sli_price_path:error_ratio6h
+        expr: |
+          1 - (
+            sum(rate(usslp_price_update_e2e_seconds_bucket{le="3"}[6h]))
+            /
+            sum(rate(usslp_price_update_e2e_seconds_count[6h]))
+          )
+      - record: usslp:sli_price_path:error_ratio1d
+        expr: |
+          1 - (
+            sum(rate(usslp_price_update_e2e_seconds_bucket{le="3"}[1d]))
+            /
+            sum(rate(usslp_price_update_e2e_seconds_count[1d]))
+          )
+      - record: usslp:sli_price_path:error_ratio3d
+        expr: |
+          1 - (
+            sum(rate(usslp_price_update_e2e_seconds_bucket{le="3"}[3d]))
+            /
+            sum(rate(usslp_price_update_e2e_seconds_count[3d]))
+          )
+      # Per-store, for the fleet view. Kept at one window only: this is 100,000
+      # series at full scale and the burn-rate maths does not need it.
+      - record: usslp:sli_price_path_by_store:error_ratio1h
+        expr: |
+          1 - (
+            sum by (store) (rate(usslp_price_update_e2e_seconds_bucket{le="3"}[1h]))
+            /
+            sum by (store) (rate(usslp_price_update_e2e_seconds_count[1h]))
+          )
+      # p50/p95/p99 for the latency dashboards.
+      - record: usslp:price_path_latency:p50
+        expr: histogram_quantile(0.50, sum by (le) (rate(usslp_price_update_e2e_seconds_bucket[5m])))
+      - record: usslp:price_path_latency:p95
+        expr: histogram_quantile(0.95, sum by (le) (rate(usslp_price_update_e2e_seconds_bucket[5m])))
+      - record: usslp:price_path_latency:p99
+        expr: histogram_quantile(0.99, sum by (le) (rate(usslp_price_update_e2e_seconds_bucket[5m])))
+
+  - name: usslp.sli.cloud-api
+    interval: 30s
+    rules:
+      # SLO: 99.95% of inbound cloud API requests succeed.
+      #
+      # obs.StandardMetrics.ObserveRequest sets outcome="error" whenever the
+      # handler returned a non-nil error and "ok" otherwise, so the ratio below
+      # is exactly the platform's own definition of a failed request rather
+      # than an HTTP status code heuristic layered on top of it.
+      - record: usslp:sli_cloud_api:error_ratio5m
+        expr: |
+          sum(rate(usslp_requests_total{outcome="error"}[5m]))
+          /
+          sum(rate(usslp_requests_total[5m]))
+      - record: usslp:sli_cloud_api:error_ratio30m
+        expr: |
+          sum(rate(usslp_requests_total{outcome="error"}[30m]))
+          /
+          sum(rate(usslp_requests_total[30m]))
+      - record: usslp:sli_cloud_api:error_ratio1h
+        expr: |
+          sum(rate(usslp_requests_total{outcome="error"}[1h]))
+          /
+          sum(rate(usslp_requests_total[1h]))
+      - record: usslp:sli_cloud_api:error_ratio2h
+        expr: |
+          sum(rate(usslp_requests_total{outcome="error"}[2h]))
+          /
+          sum(rate(usslp_requests_total[2h]))
+      - record: usslp:sli_cloud_api:error_ratio6h
+        expr: |
+          sum(rate(usslp_requests_total{outcome="error"}[6h]))
+          /
+          sum(rate(usslp_requests_total[6h]))
+      - record: usslp:sli_cloud_api:error_ratio1d
+        expr: |
+          sum(rate(usslp_requests_total{outcome="error"}[1d]))
+          /
+          sum(rate(usslp_requests_total[1d]))
+      - record: usslp:sli_cloud_api:error_ratio3d
+        expr: |
+          sum(rate(usslp_requests_total{outcome="error"}[3d]))
+          /
+          sum(rate(usslp_requests_total[3d]))
+      - record: usslp:cloud_api:error_ratio_by_service1h
+        expr: |
+          sum by (service) (rate(usslp_requests_total{outcome="error"}[1h]))
+          /
+          sum by (service) (rate(usslp_requests_total[1h]))
+
+  - name: usslp.sli.pos-ingest
+    interval: 30s
+    rules:
+      # SLO: 95% of POS deliveries are durably published within 500 ms.
+      #
+      # This is the retailer-facing number. The gateway's own internal budget is
+      # 50 ms (INTERFACE-CONTRACTS section 4) and it is tracked separately by
+      # usslp_uig_latency_budget_exceeded_total, which the component alerts use.
+      - record: usslp:sli_pos_ingest:error_ratio5m
+        expr: |
+          1 - (
+            sum(rate(usslp_uig_ingest_duration_seconds_bucket{le="0.5"}[5m]))
+            /
+            sum(rate(usslp_uig_ingest_duration_seconds_count[5m]))
+          )
+      - record: usslp:sli_pos_ingest:error_ratio30m
+        expr: |
+          1 - (
+            sum(rate(usslp_uig_ingest_duration_seconds_bucket{le="0.5"}[30m]))
+            /
+            sum(rate(usslp_uig_ingest_duration_seconds_count[30m]))
+          )
+      - record: usslp:sli_pos_ingest:error_ratio1h
+        expr: |
+          1 - (
+            sum(rate(usslp_uig_ingest_duration_seconds_bucket{le="0.5"}[1h]))
+            /
+            sum(rate(usslp_uig_ingest_duration_seconds_count[1h]))
+          )
+      - record: usslp:sli_pos_ingest:error_ratio2h
+        expr: |
+          1 - (
+            sum(rate(usslp_uig_ingest_duration_seconds_bucket{le="0.5"}[2h]))
+            /
+            sum(rate(usslp_uig_ingest_duration_seconds_count[2h]))
+          )
+      - record: usslp:sli_pos_ingest:error_ratio6h
+        expr: |
+          1 - (
+            sum(rate(usslp_uig_ingest_duration_seconds_bucket{le="0.5"}[6h]))
+            /
+            sum(rate(usslp_uig_ingest_duration_seconds_count[6h]))
+          )
+      - record: usslp:sli_pos_ingest:error_ratio1d
+        expr: |
+          1 - (
+            sum(rate(usslp_uig_ingest_duration_seconds_bucket{le="0.5"}[1d]))
+            /
+            sum(rate(usslp_uig_ingest_duration_seconds_count[1d]))
+          )
+      - record: usslp:sli_pos_ingest:error_ratio3d
+        expr: |
+          1 - (
+            sum(rate(usslp_uig_ingest_duration_seconds_bucket{le="0.5"}[3d]))
+            /
+            sum(rate(usslp_uig_ingest_duration_seconds_count[3d]))
+          )
+      - record: usslp:pos_ingest_latency:p95_by_adapter
+        expr: histogram_quantile(0.95, sum by (le, adapter) (rate(usslp_uig_ingest_duration_seconds_bucket[5m])))
+
+  - name: usslp.sli.ota
+    interval: 1m
+    rules:
+      # SLO: 99.7% of OTA device updates succeed.
+      #
+      # The denominator is the *terminal* statuses only. "pending" and
+      # "dispatched" are in flight and counting them as failures would make
+      # every rollout look like an outage the moment it started; "skipped" is a
+      # deliberate decision (quiet hours, a low battery, a device already on the
+      # target version) and is not a failure either.
+      - record: usslp:sli_ota:error_ratio30m
+        expr: |
+          sum(rate(ota_device_outcomes_total{status=~"failed|boot_failed|silent|rolled_back"}[30m]))
+          /
+          sum(rate(ota_device_outcomes_total{status=~"succeeded|failed|boot_failed|silent|rolled_back"}[30m]))
+      - record: usslp:sli_ota:error_ratio1h
+        expr: |
+          sum(rate(ota_device_outcomes_total{status=~"failed|boot_failed|silent|rolled_back"}[1h]))
+          /
+          sum(rate(ota_device_outcomes_total{status=~"succeeded|failed|boot_failed|silent|rolled_back"}[1h]))
+      - record: usslp:sli_ota:error_ratio6h
+        expr: |
+          sum(rate(ota_device_outcomes_total{status=~"failed|boot_failed|silent|rolled_back"}[6h]))
+          /
+          sum(rate(ota_device_outcomes_total{status=~"succeeded|failed|boot_failed|silent|rolled_back"}[6h]))
+      - record: usslp:sli_ota:error_ratio1d
+        expr: |
+          sum(rate(ota_device_outcomes_total{status=~"failed|boot_failed|silent|rolled_back"}[1d]))
+          /
+          sum(rate(ota_device_outcomes_total{status=~"succeeded|failed|boot_failed|silent|rolled_back"}[1d]))
+      - record: usslp:sli_ota:error_ratio3d
+        expr: |
+          sum(rate(ota_device_outcomes_total{status=~"failed|boot_failed|silent|rolled_back"}[3d]))
+          /
+          sum(rate(ota_device_outcomes_total{status=~"succeeded|failed|boot_failed|silent|rolled_back"}[3d]))
+
+  - name: usslp.sli.fleet
+    interval: 1m
+    rules:
+      # SLO: 99.5% of labels are online.
+      #
+      # registry_devices is a gauge broken down by lifecycle state
+      # (platform/internal/registry/app/service.go, DeviceState in
+      # registry/domain/device.go). "Online" is active plus degraded: a degraded
+      # label is still displaying the right price, it just has a battery or a
+      # link problem the fleet team should see. The denominator excludes
+      # `manufactured` (never deployed) and `retired` (deliberately removed),
+      # because counting either as unavailable makes a warehouse of spares look
+      # like an outage.
+      - record: usslp:fleet_labels:online_ratio
+        expr: |
+          sum(registry_devices{state=~"active|degraded"})
+          /
+          sum(registry_devices{state=~"active|degraded|offline|quarantined|assigned|provisioned"})
+      - record: usslp:sli_label_online:error_ratio30m
+        expr: 1 - avg_over_time(usslp:fleet_labels:online_ratio[30m])
+      - record: usslp:sli_label_online:error_ratio1h
+        expr: 1 - avg_over_time(usslp:fleet_labels:online_ratio[1h])
+      - record: usslp:sli_label_online:error_ratio6h
+        expr: 1 - avg_over_time(usslp:fleet_labels:online_ratio[6h])
+      - record: usslp:sli_label_online:error_ratio1d
+        expr: 1 - avg_over_time(usslp:fleet_labels:online_ratio[1d])
+      - record: usslp:sli_label_online:error_ratio3d
+        expr: 1 - avg_over_time(usslp:fleet_labels:online_ratio[3d])
+
+      # SGU uptime.
+      #
+      # `up` is Prometheus' own per-target series, not a USSLP metric. In a
+      # deployment where each region's Prometheus federates the store fleet
+      # this is the honest measure: a gateway that cannot be scraped is a
+      # gateway that is not answering, which is what "uptime" means here. The
+      # process's own usslp_process_uptime_seconds is used separately to detect
+      # restarts, because a gateway that restarts every four minutes has 100%
+      # scrape availability and is nonetheless broken.
+      - record: usslp:sgu_availability:ratio5m
+        expr: avg_over_time(up{job=~"usslp.*", service="sgu"}[5m])
+      - record: usslp:sli_sgu_uptime:error_ratio30m
+        expr: 1 - avg_over_time(up{job=~"usslp.*", service="sgu"}[30m])
+      - record: usslp:sli_sgu_uptime:error_ratio1h
+        expr: 1 - avg_over_time(up{job=~"usslp.*", service="sgu"}[1h])
+      - record: usslp:sli_sgu_uptime:error_ratio6h
+        expr: 1 - avg_over_time(up{job=~"usslp.*", service="sgu"}[6h])
+      - record: usslp:sli_sgu_uptime:error_ratio1d
+        expr: 1 - avg_over_time(up{job=~"usslp.*", service="sgu"}[1d])
+      - record: usslp:sli_sgu_uptime:error_ratio3d
+        expr: 1 - avg_over_time(up{job=~"usslp.*", service="sgu"}[3d])
+
+      # Stores currently running autonomously. sgu_store_mode is 1 when the
+      # store has lost the cloud and is pricing from its own rules.
+      - record: usslp:stores_autonomous:count
+        expr: sum(sgu_store_mode)
+      - record: usslp:stores_total:count
+        expr: count(sgu_store_mode)
+
+  # =========================================================================
+  # Delivery, fan-out and the per-hop breakdown
+  # =========================================================================
+  - name: usslp.price-path.hops
+    interval: 30s
+    rules:
+      # The hop budget from INTERFACE-CONTRACTS section 4. Only the hops the
+      # platform actually instruments appear here; the ones it does not
+      # (POS → UIG network time, the Zigbee radio itself) are visible only as
+      # the residual between the end-to-end number and the sum of these, which
+      # is exactly how the price-path dashboard presents them.
+      - record: usslp:hop_uig_ingest:p99          # budget 50 ms
+        expr: histogram_quantile(0.99, sum by (le) (rate(usslp_uig_ingest_duration_seconds_bucket[5m])))
+      - record: usslp:hop_label_fanout:p99        # part of the 120 ms slice
+        expr: histogram_quantile(0.99, sum by (le) (rate(usslp_price_fanout_duration_seconds_bucket[5m])))
+      - record: usslp:hop_device_publish:p99      # budget 100 ms
+        expr: histogram_quantile(0.99, sum by (le) (rate(usslp_device_publish_duration_seconds_bucket[5m])))
+      - record: usslp:hop_sec_delivery:p99        # budget 400 ms, SEC → label
+        expr: histogram_quantile(0.99, sum by (le, phase) (rate(sec_label_delivery_seconds_bucket[5m])))
+      - record: usslp:hop_event_handler:p99
+        expr: histogram_quantile(0.99, sum by (le, topic) (rate(usslp_event_handler_duration_seconds_bucket[5m])))
+
+  - name: usslp.delivery
+    interval: 30s
+    rules:
+      # Delivery confirmation success. `duplicate` is neither a success nor a
+      # failure — it is at-least-once delivery working correctly — so it is
+      # excluded from both sides rather than counted as either.
+      - record: usslp:label_delivery:success_ratio5m
+        expr: |
+          sum(rate(usslp_label_delivery_confirmations_total{outcome="confirmed"}[5m]))
+          /
+          sum(rate(usslp_label_delivery_confirmations_total{outcome=~"confirmed|failed"}[5m]))
+      - record: usslp:label_delivery:success_ratio_by_store1h
+        expr: |
+          sum by (store) (rate(usslp_label_delivery_confirmations_total{outcome="confirmed"}[1h]))
+          /
+          sum by (store) (rate(usslp_label_delivery_confirmations_total{outcome=~"confirmed|failed"}[1h]))
+      # Acceptance rate. OutcomeError is excluded from the denominator because
+      # infrastructure failures are retried and may be counted more than once
+      # for one logical update — the comment on app.OutcomeError says so.
+      - record: usslp:price_updates:acceptance_ratio5m
+        expr: |
+          sum(rate(usslp_price_updates_total{outcome=~"applied|scheduled"}[5m]))
+          /
+          sum(rate(usslp_price_updates_total{outcome=~"applied|scheduled|rejected|stale"}[5m]))
+      - record: usslp:labels_pending_delivery:total
+        expr: sum(usslp_labels_pending_delivery)
+
+  # =========================================================================
+  # Autoscaling inputs
+  #
+  # prometheus-adapter reads these to serve custom.metrics.k8s.io. The HPAs in
+  # the chart reference them by the bare metric name, so the names here are a
+  # contract with deploy/helm/usslp/values.yaml.
+  # =========================================================================
+  - name: usslp.autoscaling
+    interval: 30s
+    rules:
+      # pos-integration-gw scales on requests per second per pod.
+      - record: usslp_requests_per_second
+        expr: sum by (namespace, pod) (rate(usslp_requests_total[2m]))
+      # ota-service scales on queue depth. ota_downloads_in_flight is labelled
+      # by job_id; the HPA wants one number per pod.
+      - record: ota_downloads_in_flight_per_pod
+        expr: sum by (namespace, pod) (ota_downloads_in_flight)
+      # pricing-ai-service scales on decision latency rather than on CPU.
+      # usslp_pricing_tier_seconds' buckets straddle the tier budgets — 10 ms
+      # for Tier 1, 15 ms for Tier 2 — so the p99 of tier="1" is the number the
+      # SLO is actually about. Inference latency degrades before CPU saturates;
+      # by the time CPU is the signal, the budget has already been missed.
+      - record: usslp_pricing_tier1_p99_seconds
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, namespace, pod) (rate(usslp_pricing_tier_seconds_bucket{tier="1"}[2m]))
+          )
+      # Consumer lag, aggregated off the per-partition series. price-updates has
+      # 1,024 partitions; keeping the raw series as a permanent time series is
+      # ruinous and keeping the sum is free.
+      - record: usslp:consumer_lag:by_topic_group
+        expr: sum by (topic, group) (usslp_consumer_lag_records)
+      - record: usslp:eventlog_lag:by_topic_group
+        expr: sum by (topic, group) (eventlog_consumer_lag_records)
+
+  # =========================================================================
+  # Cost and capacity views
+  # =========================================================================
+  - name: usslp.capacity
+    interval: 1m
+    rules:
+      - record: usslp:mqtt_broker_connections:total
+        expr: sum(usslp_mqtt_broker_connected_clients)
+      - record: usslp:mqtt_broker_retained:total
+        expr: sum(usslp_mqtt_broker_retained_messages)
+      - record: usslp:sgu_upstream_queue_depth:max
+        expr: max by (store) (sgu_upstream_queue{measure="depth"})
+      - record: usslp:goroutines:by_service
+        expr: sum by (service) (usslp_go_goroutines)
+      - record: usslp:heap_bytes:by_service
+        expr: sum by (service) (usslp_go_heap_bytes)

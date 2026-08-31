@@ -1,0 +1,47 @@
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+---
+# Non-secret configuration only.
+#
+# Everything here is safe in a `helm template` diff, in a Git repository and in
+# an ArgoCD UI. Credentials never appear in a ConfigMap; they arrive as files
+# through the External Secrets Operator and are read through config.Loader's
+# NAME_FILE indirection (platform/pkg/config/config.go), which resolves a file
+# in preference to an environment variable of the same name.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "usslp.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "usslp.serviceLabels" (dict "ctx" $ "name" $name "svc" $svc) | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-5"
+data:
+  # The identity every metric, log line and envelope carries. obs.NewRuntime
+  # attaches service/version/region/instance as const labels on the registry,
+  # so a p99 is computed within a region rather than across three of them.
+  USSLP_LOG_LEVEL: {{ if eq $.Values.global.environment "prod" }}"info"{{ else }}"debug"{{ end }}
+  USSLP_LOG_FORMAT: {{ if eq $.Values.global.environment "prod" }}"json"{{ else }}"text"{{ end }}
+  # pprof stays off in production. obs.AdminServer only registers /debug/pprof
+  # when it is enabled, and the NetworkPolicy would refuse the traffic anyway,
+  # but defence in depth is cheap here.
+  USSLP_ENABLE_PPROF: {{ if eq $.Values.global.environment "prod" }}"false"{{ else }}"true"{{ end }}
+  # One root trace in N. The price path is always sampled regardless of this
+  # value (obs.RuntimeConfig.TraceSampleOneIn documents the override), so this
+  # governs everything else the process does.
+  USSLP_TRACE_SAMPLE_ONE_IN: {{ if eq $.Values.global.environment "prod" }}"100"{{ else }}"1"{{ end }}
+  # The span log, which is how spans reach the OTel collector's filelog bridge
+  # (deploy/observability/otel/otel-collector.yaml) until an OTLP exporter
+  # exists. It has its own severity on purpose: obs.LogExporter used to write at
+  # debug on the service logger, so USSLP_LOG_LEVEL="info" above silenced every
+  # span in production and no trace backend received anything.
+  USSLP_SPAN_LOG_LEVEL: "info"
+  # One trace in N written to that log. It is a second sampler on top of
+  # USSLP_TRACE_SAMPLE_ONE_IN because Tracer.StartAlwaysSampled bypasses head
+  # sampling on the price path — at 52,000 updates a second, "always sampled"
+  # and "always logged" are not the same requirement. Whole traces are kept or
+  # dropped together, so nothing arrives half-rendered. Set it to "1" on one
+  # service for the length of an investigation.
+  USSLP_SPAN_LOG_ONE_IN: {{ if eq $.Values.global.environment "prod" }}"100"{{ else }}"1"{{ end }}
+{{- end }}
+{{- end }}

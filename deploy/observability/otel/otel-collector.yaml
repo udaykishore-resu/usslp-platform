@@ -1,0 +1,272 @@
+# USSLP — OpenTelemetry Collector.
+#
+# ---------------------------------------------------------------------------
+# What this collector actually receives today
+# ---------------------------------------------------------------------------
+# Be clear about this, because a collector config that implies more than is
+# true is worse than none.
+#
+# USSLP's tracer is wired with obs.LogExporter (platform/pkg/obs/runtime.go,
+# spanExporters). Spans go to the structured log, not to OTLP. There is no OTLP
+# exporter in the tree yet.
+#
+# So the OTLP receiver below currently accepts spans from Envoy sidecars and
+# from infrastructure, not from USSLP processes. What makes those spans useful
+# anyway is that USSLP propagates W3C trace context (platform/pkg/obs/trace.go),
+# so an Envoy span carries the same trace ID the application logged — and the
+# `filelog` receiver below is what closes that loop today: it reads the
+# application's own span log lines and turns them into spans that join the
+# Envoy trace.
+#
+# When an OTLP exporter is added to pkg/obs, the filelog pipeline can be
+# deleted and nothing else here changes. That is the point of the arrangement.
+#
+# The metrics side needs no such apology. obs.Registry writes the Prometheus
+# text exposition format directly (platform/pkg/obs/metrics.go), so the
+# prometheus receiver scrapes USSLP processes with no adapter at all.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        # 16 MiB. A batch of spans from a store-wide fan-out is large; the
+        # default 4 MiB drops them silently at the transport layer.
+        max_recv_msg_size_mib: 16
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Scrapes the same admin ports Prometheus does. Running both is normal: the
+  # collector's copy goes to a long-term store, Prometheus' copy backs the
+  # alerting rules, and neither is a dependency of the other.
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: usslp
+          scrape_interval: 15s
+          honor_labels: true
+          kubernetes_sd_configs:
+            - role: pod
+              namespaces:
+                names: [usslp]
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_part_of]
+              action: keep
+              regex: usslp
+            - source_labels: [__meta_kubernetes_pod_container_port_name]
+              action: keep
+              regex: admin
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+            - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+              target_label: usslp_service
+
+  # The bridge described above: USSLP's tracer writes spans as structured log
+  # lines, and this turns them back into spans until an OTLP exporter exists.
+  #
+  # SPAN VOLUME IS NOT CONTROLLED BY LOG_LEVEL. obs.LogExporter used to emit at
+  # *debug* on the service's own logger, and config.LoadService defaults
+  # LOG_LEVEL to "info" for USSLP_ENVIRONMENT=prod — so this pipeline received
+  # nothing at all in production and no trace backend had any USSLP data. Spans
+  # now go to a logger of their own with its own severity:
+  #
+  #   USSLP_SPAN_LOG_LEVEL   default "info"; "off" disables the span log
+  #   USSLP_SPAN_LOG_ONE_IN  default 100; writes one trace in N to the log
+  #
+  # Both are set in deploy/helm/usslp/templates/configmap.yaml. The second knob
+  # is the one that matters here: Tracer.StartAlwaysSampled bypasses head
+  # sampling on the price path, so without it a cluster at 52,000 updates a
+  # second would write 52,000 span lines a second into this pipeline. Thinning
+  # is keyed on the trace ID, so a trace arrives whole or not at all — a
+  # half-rendered trace is worse than an absent one.
+  #
+  # For an investigation, set USSLP_SPAN_LOG_ONE_IN=1 on the one service under
+  # investigation for as long as it takes; USSLP_LOG_LEVEL no longer has any
+  # bearing on whether traces flow. The real fix is an OTLP exporter in pkg/obs,
+  # at which point this receiver, the filelog entry in the traces pipeline and
+  # both knobs are deleted together.
+  #
+  # The `msg` attribute is slog's JSON message key (platform/pkg/obs/log.go uses
+  # slog.NewJSONHandler), and "span" is the literal message LogExporter passes.
+  filelog:
+    include:
+      - /var/log/pods/usslp_*/*/*.log
+    include_file_path: false
+    start_at: end
+    operators:
+      - type: container
+        id: container-parser
+      - type: json_parser
+        id: usslp-json
+        if: 'body matches "^\\{"'
+        parse_from: body
+        parse_to: attributes
+      - type: filter
+        # Keep only the tracer's own lines. Everything else is an ordinary log
+        # line and belongs in the logs pipeline, not the traces pipeline.
+        expr: 'attributes["msg"] != "span"'
+        drop_ratio: 1.0
+
+processors:
+  # First in every pipeline. A collector that OOMs drops everything, including
+  # the telemetry that would have explained why.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 20
+
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.node.name
+        - k8s.deployment.name
+      labels:
+        - tag_name: usslp.service
+          key: usslp.io/service
+          from: pod
+        - tag_name: usslp.tier
+          key: usslp.io/tier
+          from: pod
+        - tag_name: usslp.region
+          key: usslp.io/region
+          from: pod
+
+  resource:
+    attributes:
+      - key: service.namespace
+        value: usslp
+        action: upsert
+
+  # Tail sampling. This is where the price path's "always sampled" rule is
+  # enforced for the mesh's own spans, which do not know about it.
+  #
+  # Head sampling — deciding at the root — cannot keep a trace because it turned
+  # out to be slow, since the decision is made before the latency is known. Tail
+  # sampling waits for the whole trace, which is exactly what a 3-second
+  # end-to-end budget needs: the interesting traces are the slow ones and the
+  # failed ones, and they are rare.
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 100000
+    expected_new_traces_per_sec: 2000
+    policies:
+      - name: keep-errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: keep-slow-price-path
+        # Anything over 1 second on the price path. The budget is 3 s; a trace
+        # at 1 s is already using a third of it and is worth keeping.
+        type: latency
+        latency:
+          threshold_ms: 1000
+      - name: keep-price-path-sample
+        # 10% of the price path regardless of outcome, so that "what does normal
+        # look like" is answerable. A 3-second budget cannot be debugged from a
+        # one-in-a-thousand trace.
+        type: and
+        and:
+          and_sub_policy:
+            - name: is-price-path
+              type: string_attribute
+              string_attribute:
+                key: usslp.tier
+                values: [price-path]
+            - name: ten-percent
+              type: probabilistic
+              probabilistic:
+                sampling_percentage: 10
+      - name: baseline
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 1
+
+  # Cardinality control. The tenant label on usslp_uig_ingest_total is kept
+  # deliberately in Prometheus — "is this one retailer's integration broken or
+  # all of them" is the first question of every UIG incident — but a long-term
+  # store does not need it at full resolution, and per-partition consumer lag
+  # (1,024 partitions on price-updates alone) is ruinous anywhere.
+  filter/drop-high-cardinality:
+    metrics:
+      exclude:
+        match_type: strict
+        metric_names:
+          - eventlog_segments
+  transform/aggregate-lag:
+    metric_statements:
+      - context: datapoint
+        statements:
+          - delete_key(attributes, "partition") where metric.name == "usslp_consumer_lag_records"
+          - delete_key(attributes, "partition") where metric.name == "eventlog_consumer_lag_records"
+
+exporters:
+  # Spans to Jaeger (or any OTLP backend).
+  otlp/traces:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 5000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  # Metrics re-exposed in Prometheus text format for a Prometheus to scrape.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: ""
+    # Do NOT add the collector's own resource attributes as labels: obs.Registry
+    # already attaches service, version, region and instance as const labels,
+    # and duplicating them produces two series that differ only in label naming.
+    resource_to_telemetry_conversion:
+      enabled: false
+    enable_open_metrics: true
+
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 127.0.0.1:1777
+  zpages:
+    endpoint: 127.0.0.1:55679
+
+service:
+  extensions: [health_check, pprof, zpages]
+  telemetry:
+    logs:
+      level: info
+      encoding: json
+    metrics:
+      level: detailed
+      address: 0.0.0.0:8888
+  pipelines:
+    traces:
+      receivers: [otlp, filelog]
+      processors: [memory_limiter, k8sattributes, resource, tail_sampling, batch]
+      exporters: [otlp/traces]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors:
+        - memory_limiter
+        - k8sattributes
+        - resource
+        - filter/drop-high-cardinality
+        - transform/aggregate-lag
+        - batch
+      exporters: [prometheus]

@@ -1,0 +1,69 @@
+{{- if .Values.gatewayAPI.enabled }}
+{{/*
+Gateway API.
+
+The chart creates HTTPRoutes and never the Gateway itself. A Gateway owns a load
+balancer, a public address and a certificate; giving it the lifecycle of a
+service release means every deploy is a load-balancer change, and a bad values
+file becomes a DNS outage rather than a failed rollout. The Gateway is cluster
+infrastructure and lives in the platform bootstrap.
+
+Ingress and Gateway API can both be enabled. That produces two paths to the same
+Services, which is the normal state of a migration rather than a mistake.
+*/}}
+{{- range $name, $svc := .Values.services }}
+{{- if and $svc.enabled $svc.ingressPaths }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "usslp.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "usslp.serviceLabels" (dict "ctx" $ "name" $name "svc" $svc) | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+spec:
+  parentRefs:
+    - name: {{ $.Values.gatewayAPI.parentRef.name }}
+      namespace: {{ $.Values.gatewayAPI.parentRef.namespace }}
+      sectionName: {{ $.Values.gatewayAPI.parentRef.sectionName }}
+  hostnames:
+    {{- toYaml $.Values.gatewayAPI.hostnames | nindent 4 }}
+  rules:
+    - matches:
+        {{- range $p := $svc.ingressPaths }}
+        - path:
+            # Gateway API spells these PathPrefix/Exact where Ingress spells
+            # them Prefix/Exact. Translated here rather than duplicated in
+            # values, so one list of paths drives both.
+            type: {{ if eq $p.pathType "Prefix" }}PathPrefix{{ else }}{{ $p.pathType }}{{ end }}
+            value: {{ $p.path | quote }}
+        {{- end }}
+      backendRefs:
+        - name: {{ include "usslp.fullname" $ }}-{{ $name }}
+          port: {{ $svc.ports.http }}
+          weight: 100
+      timeouts:
+        {{- if eq $name "label-service" }}
+        # A store-wide batch takes tens of seconds; the binary's own
+        # WriteTimeout is 120s.
+        request: 180s
+        backendRequest: 180s
+        {{- else if eq $name "device-registry" }}
+        request: 180s
+        backendRequest: 180s
+        {{- else }}
+        request: 60s
+        backendRequest: 60s
+        {{- end }}
+      retry:
+        # Gateway API retries are on connection-level failures and the codes
+        # listed. 502/503/504 only: a 500 may well be a request that was
+        # partially applied, and the price path's idempotency guarantees are
+        # per-envelope, not per-HTTP-request.
+        codes: [502, 503, 504]
+        attempts: 2
+        backoff: 100ms
+{{- end }}
+{{- end }}
+{{- end }}

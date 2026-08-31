@@ -1,0 +1,249 @@
+# USSLP — mesh identity and authorization.
+#
+# Applied outside the Helm chart on purpose. Mesh policy has a different blast
+# radius from a service release: a bad DestinationRule takes out every caller of
+# a service at once, and it should not ride along with a routine image bump.
+#
+#   kubectl apply -f deploy/istio/
+#
+# ---------------------------------------------------------------------------
+# STRICT, namespace-wide, no exceptions
+# ---------------------------------------------------------------------------
+# PERMISSIVE mode accepts both mTLS and plaintext, which is the correct setting
+# for exactly one thing: the minutes during a migration when some workloads are
+# injected and some are not. Left on, it is indistinguishable from having no
+# mTLS at all, because nothing ever tells you that a caller chose plaintext.
+#
+# USSLP goes STRICT from the start. The one workload that legitimately accepts
+# non-mesh traffic — the MQTT broker, which terminates connections from Store
+# Gateway Units that are appliances in a back office and will never have an
+# Envoy — is not sidecar-injected at all and carries a port-level exemption
+# below. Device identity there is device mTLS at the broker, established with
+# certificates from the platform's own hierarchy, not mesh mTLS.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: usslp-default
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  mtls:
+    mode: STRICT
+---
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: usslp-mqtt-broker
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: mqtt-broker
+  mtls:
+    mode: STRICT
+  portLevelMtls:
+    # Store Gateway Units dial these ports from outside the cluster and outside
+    # the mesh. They authenticate with a client certificate issued by the
+    # platform's own hierarchy — which is a stronger statement about identity
+    # than mesh mTLS would be, because it identifies the device rather than the
+    # pod that happens to be proxying it.
+    1883:
+      mode: DISABLE
+    8883:
+      mode: DISABLE
+---
+# ---------------------------------------------------------------------------
+# Authorization: who may call what
+#
+# Default deny for the namespace, then one ALLOW per real call path. The list
+# below is therefore a complete, reviewable statement of the platform's internal
+# call graph — which is the property that makes an authorization policy worth
+# having at all.
+# ---------------------------------------------------------------------------
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: usslp-default-deny
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  # An empty spec with action ALLOW and no rules denies everything. This is the
+  # documented Istio idiom for default-deny and it is deliberately the first
+  # policy in the file.
+  {}
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: usslp-ingress-to-edge-services
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: usslp
+  action: ALLOW
+  rules:
+    # Public API traffic arrives through the ingress gateway and nowhere else.
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account
+      to:
+        - operation:
+            ports: ["8080"]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: usslp-label-service-callers
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: label-service
+  action: ALLOW
+  rules:
+    # The Device Registry publishes device-events the Label Service builds its
+    # fan-out directory from, and reads label placement back.
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/usslp/sa/usslp-device-registry
+      to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/v1/labels/*", "/v1/stores/*"]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: usslp-device-registry-callers
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: device-registry
+  action: ALLOW
+  rules:
+    # The OTA Service resolves cohorts from the fleet.
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/usslp/sa/usslp-ota-service
+      to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/v1/devices/*", "/v1/stores/*", "/v1/fleet/*"]
+    # The Label Service resolves placement for fan-out.
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/usslp/sa/usslp-label-service
+      to:
+        - operation:
+            methods: ["GET"]
+            paths: ["/v1/stores/*", "/v1/devices/*"]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: usslp-deny-seeding-endpoint
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: device-registry
+  # A DENY rule, evaluated before every ALLOW. The registry's seeding endpoint
+  # mints device identities; it is gated behind USSLP_REGISTRY_ENABLE_SEED,
+  # which defaults to off, and this is the second lock on the same door. Two
+  # independent mechanisms, because the consequence of getting it wrong is an
+  # attacker able to enrol devices into a retailer's fleet.
+  action: DENY
+  rules:
+    - to:
+        - operation:
+            paths: ["/v1/dev/seed"]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: usslp-allow-metrics-scrape
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: usslp
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces: ["monitoring"]
+      to:
+        - operation:
+            ports: ["9090", "8083", "18083"]
+            paths: ["/metrics", "/healthz", "/readyz", "/api/v5/prometheus/stats", "/connectors"]
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: usslp-deny-pprof
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: usslp
+  # obs.AdminServer only registers /debug/pprof when EnablePprof is set, and
+  # the production ConfigMap sets it false. This denies it at the mesh as well,
+  # because a profile endpoint reachable inside the cluster is a heap dump
+  # containing prices, tenant identifiers and possibly key material.
+  action: DENY
+  rules:
+    - to:
+        - operation:
+            paths: ["/debug/pprof/*", "/debug/pprof"]
+---
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: usslp-tracing
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  tracing:
+    - providers:
+        - name: otel
+      # 1% baseline. The price path is always sampled by the application's own
+      # tracer regardless (obs.RuntimeConfig documents the override), and a
+      # 3-second end-to-end budget cannot be debugged from a one-in-a-thousand
+      # trace. USSLP propagates W3C trace context, so an Envoy span and an
+      # application span join the same trace.
+      randomSamplingPercentage: 1.0
+      customTags:
+        usslp_service:
+          header:
+            name: x-usslp-service
+            defaultValue: unknown
+  accessLogging:
+    - providers:
+        - name: envoy
+      filter:
+        # Only log what failed. At 52,000 price updates a second an access log
+        # of successes is a bill, not a signal.
+        expression: "response.code >= 400"

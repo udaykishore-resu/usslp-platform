@@ -1,0 +1,389 @@
+{
+  "uid": "usslp-fleet-health",
+  "title": "USSLP — Store and Fleet Health",
+  "description": "The edge tier: Store Gateway Units, Shelf Edge Controllers, the Zigbee mesh, and the label fleet's lifecycle states. The question this board answers is 'which stores are unhappy and why', not 'is the cloud up'.",
+  "tags": ["usslp", "fleet", "edge"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "1m",
+  "time": { "from": "now-12h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "usslp-prometheus" }
+      },
+      {
+        "name": "store",
+        "label": "Store",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(sgu_store_mode, store)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Stores reporting",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 0 },
+      "targets": [{ "refId": "A", "expr": "usslp:stores_total:count", "legendFormat": "stores" }],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "options": { "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Autonomous now",
+      "description": "The store has lost the cloud and is pricing from its own rules. Nothing is broken on the shelf — this is the design working. What it means operationally is that the cloud's record of this store has a gap it will backfill on recovery.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 0 },
+      "targets": [{ "refId": "A", "expr": "usslp:stores_autonomous:count", "legendFormat": "autonomous" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "red", "value": 50 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "SGU availability (5m)",
+      "description": "avg_over_time(up) for the sgu job. A gateway that cannot be scraped is a gateway that is not answering. Restarts are tracked separately — a gateway that restarts every four minutes has ~100% scrape availability and is nonetheless broken.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 0 },
+      "targets": [{ "refId": "A", "expr": "avg(usslp:sgu_availability:ratio5m)", "legendFormat": "up" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 4,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.995 },
+              { "color": "green", "value": 0.999 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "value", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 4,
+      "type": "piechart",
+      "title": "Label fleet by lifecycle state",
+      "description": "registry_devices. The states are the closed set in platform/internal/registry/domain/device.go: manufactured, provisioned, assigned, active, degraded, offline, quarantined, retired.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (state) (registry_devices)",
+          "legendFormat": "{{state}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] },
+        "pieType": "donut"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Deepest upstream queue",
+      "description": "Buffered upstream messages waiting for the WAN. Full is not unready — the store is still pricing correctly — but it is the one queue state that loses data: when it fills, the cloud's record of the outage has gaps no replay can recover. Default cap 50,000.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 5 },
+      "targets": [
+        { "refId": "A", "expr": "max(usslp:sgu_upstream_queue_depth:max)", "legendFormat": "deepest queue" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 25000 },
+              { "color": "red", "value": 45000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Per-store detail",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 10 }
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Stores ranked by unhappiness",
+      "description": "Autonomous mode, queue depth and pending deliveries side by side. A store that is autonomous with a shallow queue is a short WAN blip; autonomous with a deep queue is an outage that is about to lose data; not autonomous but with rising pending deliveries is a mesh problem inside the building.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 11, "w": 24, "x": 0, "y": 11 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sgu_store_mode{store=~\"$store\"}",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "expr": "sgu_upstream_queue{measure=\"depth\", store=~\"$store\"}",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "C",
+          "expr": "usslp_labels_pending_delivery{store=~\"$store\"}",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "D",
+          "expr": "usslp:label_delivery:success_ratio_by_store1h",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "measure": true, "instance": true },
+            "renameByName": {
+              "store": "Store",
+              "Value #A": "Autonomous",
+              "Value #B": "Queue depth",
+              "Value #C": "Pending deliveries",
+              "Value #D": "Delivery success (1h)"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "cellOptions": { "type": "auto" } } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Delivery success (1h)" },
+            "properties": [
+              { "id": "unit", "value": "percentunit" },
+              { "id": "decimals", "value": 3 },
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-background", "mode": "gradient" }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "orange", "value": 0.98 },
+                    { "color": "green", "value": 0.995 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Queue depth" },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "orange", "value": 25000 },
+                    { "color": "red", "value": 45000 }
+                  ]
+                }
+              },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "sortBy": [{ "displayName": "Queue depth", "desc": true }],
+        "footer": { "show": false }
+      }
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Gateway bridge and reconciliation",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Bridged messages by direction and outcome",
+      "description": "The SGU runs the store's broker and is a client of the cloud broker. It bridges downstream (cloud to local) so controllers only ever talk to a broker inside the building, and upstream (local to cloud), buffering to disk while the WAN is down.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (direction, outcome) (rate(sgu_bridged_total{store=~\"$store\"}[5m]))",
+          "legendFormat": "{{direction}} / {{outcome}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean"] } }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Reconciliation conflicts by resolution",
+      "description": "Expected after an outage: the store priced locally while the cloud priced centrally, and reconciliation picks a winner. A steady rate outside an outage window means the local rules and the central prices genuinely disagree.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (resolution) (rate(sgu_merge_conflicts_total{store=~\"$store\"}[15m]))",
+          "legendFormat": "{{resolution}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum"] } }
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Zigbee mesh",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Mesh deliveries by outcome",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 32 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(sec_mesh_deliveries_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "stacking": { "mode": "normal" }, "fillOpacity": 25 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Predicted link failure risk (top 10 links)",
+      "description": "sec_mesh_link_failure_risk is the predictive healing model's probability that a link fails within its horizon. High measured failure with low predicted risk means the model is missing something the radio is seeing.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(10, sec_mesh_link_failure_risk)",
+          "legendFormat": "{{sec}} -> {{peer}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last"] } }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Reroutes by trigger",
+      "description": "Routes moved off a link. A steady trickle is predictive healing doing its job; a burst is a physical change in the store — a shelf moved, a freezer door left open, a new metal fixture.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (trigger) (rate(sec_mesh_reroutes_total[15m]))",
+          "legendFormat": "{{trigger}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 40,
+      "type": "row",
+      "title": "OTA",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 }
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Device outcomes by status",
+      "description": "The terminal statuses are succeeded, failed, boot_failed, silent and rolled_back. pending and dispatched are in flight; skipped is a deliberate decision (quiet hours, low battery, already on target). The SLO denominator is the terminal set only.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (status) (rate(ota_device_outcomes_total[15m]))",
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "stacking": { "mode": "normal" }, "fillOpacity": 25 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum"] } }
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Downloads in flight and suppressed dispatches",
+      "description": "ota_dispatch_suppressed_total's reason label separates quiet hours from battery holds from concurrency caps — which is the difference between 'the rollout is waiting' and 'the rollout is stuck'.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "targets": [
+        { "refId": "A", "expr": "sum(ota_downloads_in_flight)", "legendFormat": "in flight" },
+        {
+          "refId": "B",
+          "expr": "sum by (reason) (rate(ota_dispatch_suppressed_total[15m]))",
+          "legendFormat": "suppressed: {{reason}}"
+        },
+        { "refId": "C", "expr": "sum(increase(ota_rollbacks_total[1h]))", "legendFormat": "rollbacks (1h)" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    }
+  ]
+}

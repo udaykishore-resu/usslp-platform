@@ -1,0 +1,7 @@
+{
+  "name": "audit-log",
+  "partitions": 4,
+  "retention_hours": 8760,
+  "compacted": false,
+  "description": "Immutable compliance record"
+}

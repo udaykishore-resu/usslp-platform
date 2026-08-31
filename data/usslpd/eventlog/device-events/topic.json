@@ -1,0 +1,7 @@
+{
+  "name": "device-events",
+  "partitions": 4,
+  "retention_hours": 720,
+  "compacted": false,
+  "description": "Device lifecycle: provisioned, online, offline"
+}

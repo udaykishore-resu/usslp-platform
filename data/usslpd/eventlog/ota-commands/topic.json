@@ -1,0 +1,7 @@
+{
+  "name": "ota-commands",
+  "partitions": 4,
+  "retention_hours": 168,
+  "compacted": false,
+  "description": "Firmware rollout commands"
+}

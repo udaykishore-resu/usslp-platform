@@ -1,0 +1,56 @@
+# Prometheus for the dev compose profile.
+#
+# Every USSLP binary exposes /metrics in Prometheus text exposition format on
+# its admin port (platform/pkg/obs/admin.go). There is no exporter, no adapter
+# and no push gateway: the process is scraped directly.
+#
+# Targets are static because compose service names are stable. In Kubernetes the
+# equivalent is the ServiceMonitor in deploy/helm/usslp/templates.
+
+global:
+  scrape_interval: 10s
+  scrape_timeout: 5s
+  evaluation_interval: 15s
+  external_labels:
+    environment: dev
+    region: local
+
+rule_files:
+  - /etc/prometheus/rules/recording-rules.yaml
+  # The SLO alert rules use multi-window burn rates over hours; on a laptop they
+  # will never fire, which is correct. They are loaded so that a syntax error is
+  # caught here rather than in a cluster.
+  - /etc/prometheus/rules/slo-alerts.yaml
+  - /etc/prometheus/rules/component-alerts.yaml
+
+scrape_configs:
+  # Every service reports the same standard series under the same names
+  # (obs.StandardMetrics), so one job with a target list is enough. The
+  # `service`, `version`, `region` and `instance` labels are const labels the
+  # registry attaches itself — see obs.NewRuntime — so honor_labels is on to
+  # keep them rather than have Prometheus overwrite `instance` with host:port.
+  - job_name: usslp
+    honor_labels: true
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - cloud-broker:9090
+          - store-gateway:9090
+          - uig:9090
+          - label-service:9090
+          - ota-service:9090
+          - labelsim:9090
+        labels:
+          environment: dev
+      # Opt-in services; Prometheus marks them down until they are started with
+      # their compose profile, which is honest rather than hidden.
+      - targets:
+          - device-registry:9090
+          - sec:9090
+        labels:
+          environment: dev
+          optional: "true"
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

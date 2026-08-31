@@ -1,0 +1,48 @@
+# Prometheus for the prod-like compose profile.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 30s
+  external_labels:
+    environment: prod-like
+    region: us-east-1
+
+rule_files:
+  - /etc/prometheus/rules/recording-rules.yaml
+  - /etc/prometheus/rules/slo-alerts.yaml
+  - /etc/prometheus/rules/component-alerts.yaml
+
+scrape_configs:
+  - job_name: usslp
+    honor_labels: true
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - uig:9090
+          - label-service:9090
+          - ota-service:9090
+          - store-gateway:9090
+          - labelsim:9090
+
+  # EMQX exposes Prometheus metrics on 18083 when EMQX_PROMETHEUS__ENABLE is on.
+  # These are EMQX's own series (emqx_*), not USSLP's; the alert rules that
+  # reference broker health use USSLP's usslp_mqtt_client_connected, which every
+  # USSLP process that holds a broker link reports for itself.
+  - job_name: emqx
+    metrics_path: /api/v5/prometheus/stats
+    static_configs:
+      - targets: ["emqx:18083"]
+
+  - job_name: kafka-connect
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["kafka-connect:8083"]
+
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

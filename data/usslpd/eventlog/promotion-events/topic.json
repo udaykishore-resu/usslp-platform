@@ -1,0 +1,7 @@
+{
+  "name": "promotion-events",
+  "partitions": 4,
+  "retention_hours": 2160,
+  "compacted": false,
+  "description": "Promotion lifecycle"
+}

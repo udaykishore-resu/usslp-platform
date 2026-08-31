@@ -1,0 +1,112 @@
+{{- range $name, $svc := .Values.services }}
+{{- if and $svc.enabled (eq (default "Deployment" $svc.kind) "StatefulSet") }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "usslp.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "usslp.serviceLabels" (dict "ctx" $ "name" $name "svc" $svc) | nindent 4 }}
+  annotations:
+    # Wave 0: the broker is infrastructure. Every service that opens an MQTT
+    # session on boot must find it already listening, or its first readiness
+    # check fails and the rollout stalls on a dependency that is merely late.
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  serviceName: {{ include "usslp.fullname" $ }}-{{ $name }}-headless
+  replicas: {{ $svc.replicas.min }}
+  revisionHistoryLimit: 5
+  # OrderedReady, not Parallel. EMQX forms an Erlang cluster; bringing five
+  # nodes up simultaneously races the cluster discovery and can produce two
+  # partitions that both believe they are the cluster.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  selector:
+    matchLabels:
+      {{- include "usslp.serviceSelectorLabels" (dict "ctx" $ "name" $name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "usslp.serviceLabels" (dict "ctx" $ "name" $name "svc" $svc) | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") $ | sha256sum }}
+        {{- if $.Values.istio.enabled }}
+        # The broker terminates MQTT from devices outside the mesh, so it is
+        # not sidecar-injected: an Envoy in front of a long-lived MQTT session
+        # buys nothing and adds a hop to a latency budget that has 150 ms for
+        # this whole leg. mTLS to the broker is device mTLS, not mesh mTLS.
+        sidecar.istio.io/inject: "false"
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "usslp.fullname" $ }}-{{ $name }}
+      # EMQX's Kubernetes cluster discovery reads the endpoints of its own
+      # headless Service through the API server, so this pod does need a token.
+      automountServiceAccountToken: true
+      {{- if $.Values.priorityClasses.create }}
+      priorityClassName: {{ $svc.priorityClassName }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $svc.terminationGracePeriodSeconds }}
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "usslp.podSecurityContext" (dict "ctx" $ "svc" $svc) | nindent 8 }}
+      topologySpreadConstraints:
+        {{- include "usslp.topologySpread" (dict "ctx" $ "name" $name) | nindent 8 }}
+      {{- with $.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "usslp.image" (dict "ctx" $ "svc" $svc) }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          securityContext:
+            {{- include "usslp.containerSecurityContext" (dict "ctx" $ "svc" $svc) | nindent 12 }}
+          ports:
+            {{- range $portName, $portNumber := $svc.ports }}
+            - name: {{ $portName }}
+              containerPort: {{ $portNumber }}
+              protocol: TCP
+            {{- end }}
+          env:
+            {{- include "usslp.env" (dict "ctx" $ "svc" $svc) | nindent 12 }}
+            # EMQX derives its node name from the pod's stable DNS name, which
+            # is the whole reason this is a StatefulSet.
+            - name: EMQX_HOST
+              value: "$(POD_NAME).{{ include "usslp.fullname" $ }}-{{ $name }}-headless.$(POD_NAMESPACE).svc.{{ $.Values.global.clusterDomain }}"
+          envFrom:
+            - configMapRef:
+                name: {{ include "usslp.fullname" $ }}-{{ $name }}
+          {{- include "usslp.probes" (dict "svc" $svc) | nindent 10 }}
+          lifecycle:
+            {{- include "usslp.lifecycle" . | nindent 12 }}
+          resources:
+            {{- toYaml $svc.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "usslp.volumeMounts" (dict "svc" $svc) | nindent 12 }}
+      volumes:
+        {{- include "usslp.volumes" (dict "ctx" $ "svc" $svc "name" $name) | nindent 8 }}
+  {{- if and $svc.storage (eq $svc.storage.kind "persistentVolumeClaim") }}
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+        labels:
+          {{- include "usslp.serviceLabels" (dict "ctx" $ "name" $name "svc" $svc) | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ $svc.storage.storageClassName }}
+        resources:
+          requests:
+            storage: {{ $svc.storage.size }}
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,68 @@
+{
+  "usslp_pki_format": "usslp.pki.hierarchy.v1",
+  "created_at": "2026-08-31T22:26:58.622627Z",
+  "profile": {
+    "organization": "USSLP",
+    "country": "US",
+    "trust_domain": "usslp.io",
+    "root_key": "ecdsa-p256",
+    "intermediate_key": "ecdsa-p256",
+    "sub_ca_key": "ecdsa-p256",
+    "label_key": "ecdsa-p256",
+    "controller_key": "ecdsa-p256",
+    "service_key": "ecdsa-p256",
+    "tenant_key": "ecdsa-p256",
+    "root_validity": 630720000000000000,
+    "intermediate_validity": 315360000000000000,
+    "sub_ca_validity": 157680000000000000,
+    "label_validity": 63072000000000000,
+    "controller_validity": 31536000000000000,
+    "service_validity": 7776000000000000,
+    "tenant_validity": 31536000000000000,
+    "backdate": 300000000000
+  },
+  "authorities": [
+    {
+      "role": "root",
+      "key_spec": "ecdsa-p256",
+      "common_name": "USSLP Root CA",
+      "serial": "11d2c72c0b9f368be966bee286e2ceaa",
+      "not_after": "2046-08-26T22:26:58Z"
+    },
+    {
+      "role": "device-issuance",
+      "key_spec": "ecdsa-p256",
+      "common_name": "USSLP Device Issuance CA",
+      "serial": "2e3c7352090b0076f8760e767a935d84",
+      "not_after": "2036-08-28T22:26:58Z"
+    },
+    {
+      "role": "manufacturing",
+      "key_spec": "ecdsa-p256",
+      "common_name": "USSLP Manufacturing Sub-CA",
+      "serial": "60eac194a1dcd2976e0eda510ecbbc91",
+      "not_after": "2031-08-30T22:26:58Z"
+    },
+    {
+      "role": "shelf-controller",
+      "key_spec": "ecdsa-p256",
+      "common_name": "USSLP Shelf Controller Sub-CA",
+      "serial": "20f077d24b022f54d07572802ab6c95a",
+      "not_after": "2031-08-30T22:26:58Z"
+    },
+    {
+      "role": "services",
+      "key_spec": "ecdsa-p256",
+      "common_name": "USSLP Services CA",
+      "serial": "368d9f70b57db6466b160b30ae2b3387",
+      "not_after": "2036-08-28T22:26:58Z"
+    },
+    {
+      "role": "tenant-management",
+      "key_spec": "ecdsa-p256",
+      "common_name": "USSLP Tenant Management CA",
+      "serial": "34c0f11b36b4b9d59f74437d4358c7f0",
+      "not_after": "2036-08-28T22:26:58Z"
+    }
+  ]
+}

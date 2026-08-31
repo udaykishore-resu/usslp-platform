@@ -1,0 +1,80 @@
+{{/*
+PodDisruptionBudget rationale
+=============================
+
+A PDB constrains *voluntary* disruption only: node drains, cluster-autoscaler
+scale-down, a kubectl drain during an upgrade. It does nothing about a node
+catching fire. So the number is not "how many pods must survive a disaster", it
+is "how much capacity is the platform willing to lose while a human or a
+controller is deliberately taking nodes away".
+
+The numbers below come from the platform specification's capacity table, and
+each one is a statement about the same thing: what happens to a retailer if this
+service is degraded during a maintenance window.
+
+  label-service      min 4 of 6-30. Four pods carry peak price traffic for one
+                     region with one AZ already lost. A drain may take two; the
+                     third is refused, because a fan-out that cannot keep up
+                     leaves some shelves showing a promotion and some the old
+                     price — which is the compliance failure the whole platform
+                     exists to prevent.
+
+  pos-integration-gw min 3 of 4-20. This is the front door for every retailer's
+                     POS. A refused delivery becomes a POS retry, and a retry
+                     storm at a chain's nightly price-load is worse than the
+                     drain being slow. One pod may go; two may not.
+
+  device-registry    min 2 of 3-10. Provisioning and planogram uploads can
+                     queue; the health sweep that turns silence into an offline
+                     event cannot stop entirely, because that is what feeds the
+                     fleet's availability SLO.
+
+  mqtt-broker        min 3 of 5. EMQX's session store needs a majority to
+                     rebalance safely. Draining below three risks a split whose
+                     resolution drops persistent sessions, and a dropped session
+                     is an un-acknowledged QoS 1 price update — a price that
+                     never reached a shelf and that nobody knows never reached
+                     it.
+
+  kafka-connect      min 2 of 3-8. Every membership change triggers a group
+                     rebalance that stops every task. Two survivors keep change
+                     capture flowing while the third is replaced.
+
+  ota-service        min 1 of 2-6. A rollout is resumable and quiet-hours-aware.
+                     Pausing it is a delay, not an incident, so the budget
+                     permits a full drain down to one pod.
+
+  analytics-service  min 1 of 2-8. Replayable from the stream. The cheapest
+                     thing on the cluster to lose, and the budget says so.
+
+  pricing-ai-service min 2 of 3-12. On the price path, so it gets a real budget
+                     even though it is disabled until the binary exists.
+
+The chart refuses to render a service whose replicas.min does not exceed its
+pdb.minAvailable (see `usslp.validate` in _helpers.tpl). A budget equal to the
+floor makes every voluntary disruption impossible: the drain blocks forever and
+the cluster autoscaler stalls on a node it can never empty.
+*/}}
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "usslp.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "usslp.serviceLabels" (dict "ctx" $ "name" $name "svc" $svc) | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+spec:
+  minAvailable: {{ $svc.pdb.minAvailable }}
+  # IfHealthyBudget, not AlwaysAllow. An unhealthy pod that is nonetheless
+  # inside the budget is not automatically evictable, because "unhealthy" during
+  # a deploy usually means "still starting up", and evicting those is how a
+  # rolling update becomes an outage.
+  unhealthyPodEvictionPolicy: IfHealthyBudget
+  selector:
+    matchLabels:
+      {{- include "usslp.serviceSelectorLabels" (dict "ctx" $ "name" $name) | nindent 6 }}
+{{- end }}
+{{- end }}

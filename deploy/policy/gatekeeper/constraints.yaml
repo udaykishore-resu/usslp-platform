@@ -1,0 +1,180 @@
+# USSLP — Gatekeeper constraints.
+#
+# ---------------------------------------------------------------------------
+# enforcementAction, and how to roll a policy out without causing an outage
+# ---------------------------------------------------------------------------
+# Every constraint here supports three actions:
+#
+#   dryrun  — evaluate and record violations in status; admit everything.
+#   warn    — admit, but return the violation to the client as a warning.
+#   deny    — reject.
+#
+# The order a new policy goes through is dryrun → warn → deny, with the
+# violation count checked at each step. Going straight to deny on a cluster you
+# did not write every workload in is how a policy rollout becomes an incident:
+# the first thing it blocks is usually a cluster-critical DaemonSet nobody
+# remembered was there.
+#
+# The constraints below are at `deny` because the USSLP namespace contains only
+# workloads this repository deploys, and every one of them was checked against
+# these rules before they were written. `excludedNamespaces` covers the
+# system namespaces whose workloads USSLP does not own and must not break.
+
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: USSLPDisallowedTags
+metadata:
+  name: usslp-no-mutable-tags
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps", ""]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet", "Pod", "Job", "CronJob"]
+    namespaces: ["usslp"]
+  parameters:
+    tags:
+      - latest
+      - main
+      - master
+      - stable
+      - edge
+      - dev
+    exemptImages: []
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: USSLPAllowedRegistries
+metadata:
+  name: usslp-allowed-registries
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps", ""]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet", "Pod", "Job", "CronJob"]
+    namespaces: ["usslp"]
+  parameters:
+    # The complete list of places an image in the USSLP namespace may come
+    # from. Everything here is either the platform's own registry or a
+    # specific, pinned third-party workload the chart deploys.
+    registries:
+      # USSLP's own images.
+      - ghcr.io/usslp/
+      # The upstream images the chart templates directly. Named individually
+      # rather than allow-listing docker.io, which would allow everything.
+      - docker.io/emqx/emqx
+      - docker.io/confluentinc/cp-kafka-connect
+      - docker.io/bitnami/kafka
+      # Distroless, for the base image an in-cluster rebuild might reference.
+      - gcr.io/distroless/
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: USSLPRequiredLabels
+metadata:
+  name: usslp-required-labels
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet"]
+    namespaces: ["usslp"]
+  parameters:
+    labels:
+      - key: app.kubernetes.io/name
+        allowedRegex: "^[a-z0-9-]+$"
+      - key: app.kubernetes.io/component
+        allowedRegex: "^[a-z0-9-]+$"
+      - key: app.kubernetes.io/part-of
+        allowedRegex: "^usslp$"
+      - key: app.kubernetes.io/managed-by
+        allowedRegex: "^(Helm|argocd)$"
+      # The platform's own selectors. usslp.io/tier is what makes "everything
+      # on the price path" a label query; the PriorityClass names it too, and
+      # the chart derives one from the other so they cannot disagree.
+      - key: usslp.io/service
+        allowedRegex: "^[a-z0-9-]+$"
+      - key: usslp.io/tier
+        allowedRegex: "^(price-path|platform|analytics)$"
+      - key: usslp.io/region
+        allowedRegex: "^(us-east-1|eu-west-1|ap-south-1|local)$"
+      - key: usslp.io/environment
+        allowedRegex: "^(dev|staging|prod)$"
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: USSLPResourceLimits
+metadata:
+  name: usslp-resource-limits
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps", ""]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet", "Pod"]
+    namespaces: ["usslp"]
+  parameters:
+    required: ["cpu", "memory"]
+    exemptImages: []
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: USSLPSecurityContext
+metadata:
+  name: usslp-security-context
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps", ""]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet", "Pod"]
+    namespaces: ["usslp"]
+  parameters:
+    requireReadOnlyRoot: true
+    # Two exemptions, both third-party, both stated rather than implied.
+    #
+    # EMQX writes its Mnesia tables and its configuration cache under
+    # /opt/emqx. Kafka Connect writes plugin state and offsets under /tmp and
+    # /usr/share. Both could be worked around with four or five more emptyDir
+    # mounts each, which trades a real hardening control for a pile of mounts
+    # nobody will maintain — and in both cases the writable path is a PVC or an
+    # emptyDir that no other workload can reach.
+    #
+    # Every USSLP-built image runs with a read-only root and has no shell.
+    exemptWorkloads:
+      - mqtt-broker
+      - kafka-connect
+---
+# Data residency. Applied only in the two regions that enforce it; the
+# us-east-1 cluster does not carry this constraint at all, which is why the
+# parameter is the region rather than a boolean.
+#
+# Apply exactly one of these per cluster.
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: USSLPDataResidency
+metadata:
+  name: usslp-residency-eu-west-1
+  annotations:
+    usslp.io/apply-in: "eu-west-1 clusters only"
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet"]
+    namespaces: ["usslp"]
+  parameters:
+    region: eu-west-1
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: USSLPDataResidency
+metadata:
+  name: usslp-residency-ap-south-1
+  annotations:
+    usslp.io/apply-in: "ap-south-1 clusters only"
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet"]
+    namespaces: ["usslp"]
+  parameters:
+    region: ap-south-1

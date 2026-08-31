@@ -1,0 +1,17 @@
+{
+  "usslp_keyring_format": "usslp.keyring.v1",
+  "generated_at": "2026-08-31T22:26:58.627326Z",
+  "active_kid": "usslp-price-4164aee78350acac",
+  "keys": [
+    {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "use": "sig",
+      "alg": "EdDSA",
+      "kid": "usslp-price-4164aee78350acac",
+      "x": "uXeotzG7mN6ZqJspWPTOaXJwykxJQ7Vwr40YTaw7iDw",
+      "usslp_status": "active",
+      "usslp_not_before": "2026-08-31T22:26:58.626054Z"
+    }
+  ]
+}

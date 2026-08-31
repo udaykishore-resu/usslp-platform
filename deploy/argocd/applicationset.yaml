@@ -1,0 +1,284 @@
+# USSLP — ArgoCD ApplicationSet: one Application per (region × environment).
+#
+# ---------------------------------------------------------------------------
+# Why a list generator and not a matrix
+# ---------------------------------------------------------------------------
+# A matrix of {regions} × {environments} would produce nine Applications, six
+# of which do not exist: there is no staging cluster in eu-west-1 and no dev
+# cluster in ap-south-1, and there never will be. A generator that produces
+# Applications for clusters that do not exist gives you six permanently
+# unhealthy rows in the ArgoCD UI, which is how people learn to stop reading
+# the ArgoCD UI.
+#
+# The list is explicit. Adding a region is adding an entry.
+#
+# ---------------------------------------------------------------------------
+# Sync waves
+# ---------------------------------------------------------------------------
+# Ordering is expressed as argocd.argoproj.io/sync-wave annotations on the
+# objects themselves (see the chart templates), not here. The waves are:
+#
+#   -20  PriorityClasses          cluster-scoped, referenced by everything
+#   -10  ServiceAccounts, RBAC, NetworkPolicies
+#    -6  the topic job's ServiceAccount
+#    -5  ConfigMaps, ExternalSecrets, the topic-provisioning PreSync hook
+#     0  mqtt-broker StatefulSet + its headless Service
+#     5  Services
+#    10  Deployments
+#    15  HPAs, PDBs
+#    20  Ingress/HTTPRoute, ServiceMonitor, PrometheusRule
+#
+# The principle: nothing that consumes a thing syncs before the thing. A
+# Deployment whose ExternalSecret has not been reconciled starts, fails to read
+# its projected credential and crash-loops, and the operator debugging it at
+# 3 a.m. sees a service bug rather than a sync-ordering bug.
+
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: usslp
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  # Prune and delete orphans only when the ApplicationSet itself is deleted
+  # deliberately. `background` means removing an entry from the list actually
+  # removes the Application; without it, decommissioning a region leaves the
+  # Application behind pointing at a cluster that no longer answers.
+  syncPolicy:
+    preserveResourcesOnDeletion: false
+
+  generators:
+    - list:
+        elements:
+          # -------------------------------------------------------------
+          # Development
+          # -------------------------------------------------------------
+          - name: dev
+            region: local
+            environment: dev
+            cluster: https://kubernetes.default.svc
+            valuesFile: values-dev.yaml
+            namespace: usslp
+            # Auto-sync with self-heal: a dev cluster should always be exactly
+            # what is in Git, and there is nothing in it worth protecting from
+            # a bad commit.
+            autoSync: "true"
+            selfHeal: "true"
+            revision: main
+
+          # -------------------------------------------------------------
+          # Staging (us-east-1 only)
+          # -------------------------------------------------------------
+          - name: staging-use1
+            region: us-east-1
+            environment: staging
+            cluster: https://staging-use1.REPLACE-ME.eks.amazonaws.com
+            valuesFile: values-staging.yaml
+            namespace: usslp
+            autoSync: "true"
+            selfHeal: "true"
+            revision: main
+
+          # -------------------------------------------------------------
+          # Production
+          #
+          # No auto-sync. A production sync is a deliberate act with a human
+          # attached to it, and the canary analysis in the Rollout is what
+          # decides whether it proceeds. Auto-syncing production would mean a
+          # merge to main is a production deploy with no gate at all.
+          #
+          # revision is a tag, not a branch: production tracks releases.
+          # -------------------------------------------------------------
+          - name: prod-use1
+            region: us-east-1
+            environment: prod
+            cluster: https://prod-use1.REPLACE-ME.eks.amazonaws.com
+            valuesFile: values-prod-use1.yaml
+            namespace: usslp
+            autoSync: "false"
+            selfHeal: "false"
+            revision: "release-*"
+
+          - name: prod-euw1
+            region: eu-west-1
+            environment: prod
+            cluster: https://prod-euw1.REPLACE-ME.eks.amazonaws.com
+            valuesFile: values-prod-euw1.yaml
+            namespace: usslp
+            autoSync: "false"
+            selfHeal: "false"
+            revision: "release-*"
+
+          - name: prod-aps1
+            region: ap-south-1
+            environment: prod
+            cluster: https://prod-aps1.REPLACE-ME.eks.amazonaws.com
+            valuesFile: values-prod-aps1.yaml
+            namespace: usslp
+            autoSync: "false"
+            selfHeal: "false"
+            revision: "release-*"
+
+  template:
+    metadata:
+      name: "usslp-{{ .name }}"
+      labels:
+        app.kubernetes.io/part-of: usslp
+        usslp.io/region: "{{ .region }}"
+        usslp.io/environment: "{{ .environment }}"
+      annotations:
+        # Sort order in the ArgoCD UI: dev first, production last, so the list
+        # reads in the order a change travels through it.
+        argocd.argoproj.io/manifest-generate-paths: ".;../.."
+    spec:
+      project: usslp
+      source:
+        repoURL: https://github.com/usslp/usslp.git
+        targetRevision: "{{ .revision }}"
+        path: deploy/helm/usslp
+        helm:
+          releaseName: usslp
+          valueFiles:
+            - values.yaml
+            - "{{ .valuesFile }}"
+          parameters:
+            # The region and environment are set from the generator rather than
+            # trusted from the values file, so that a copy-paste error in a
+            # values file cannot point a cluster at another region's secrets.
+            - name: global.region
+              value: "{{ .region }}"
+            - name: global.environment
+              value: "{{ .environment }}"
+      destination:
+        server: "{{ .cluster }}"
+        namespace: "{{ .namespace }}"
+      syncPolicy:
+        # goTemplate on the ApplicationSet makes these conditionals possible;
+        # see spec.goTemplate below.
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          # ServerSideApply. The chart produces objects large enough to blow the
+          # 256 KB last-applied-configuration annotation — the PrometheusRule
+          # with every SLO group in it is the obvious one — and a client-side
+          # apply silently truncates rather than failing.
+          - ServerSideApply=true
+          - ApplyOutOfSyncOnly=true
+          # Respect the ignoreDifferences below rather than fighting the HPA.
+          - RespectIgnoreDifferences=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 5m
+      ignoreDifferences:
+        # The HPA owns the replica count. The chart deliberately omits
+        # `replicas` on autoscaled Deployments for the same reason, but ArgoCD
+        # will still see a diff against a live object that has one.
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas
+        # Argo Rollouts rewrites the VirtualService weights during a canary.
+        # ArgoCD must not revert them mid-rollout, which would snap 100% of
+        # traffic back to stable in the middle of an analysis.
+        - group: networking.istio.io
+          kind: VirtualService
+          jqPathExpressions:
+            - .spec.http[].route[].weight
+        # The External Secrets Operator owns the Secret's data.
+        - group: ""
+          kind: Secret
+          jsonPointers:
+            - /data
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+---
+# The AppProject. It is the blast-radius boundary: an Application in this
+# project can only deploy this chart, to these clusters, into this namespace,
+# and can only create the kinds listed.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: usslp
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  description: USSLP cloud tier
+  sourceRepos:
+    - https://github.com/usslp/usslp.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: usslp
+    - server: https://staging-use1.REPLACE-ME.eks.amazonaws.com
+      namespace: usslp
+    - server: https://prod-use1.REPLACE-ME.eks.amazonaws.com
+      namespace: usslp
+    - server: https://prod-euw1.REPLACE-ME.eks.amazonaws.com
+      namespace: usslp
+    - server: https://prod-aps1.REPLACE-ME.eks.amazonaws.com
+      namespace: usslp
+  clusterResourceWhitelist:
+    # Cluster-scoped kinds this project may create. PriorityClass is the only
+    # one the chart needs; everything else is namespaced.
+    - group: scheduling.k8s.io
+      kind: PriorityClass
+  namespaceResourceWhitelist:
+    - group: ""
+      kind: "*"
+    - group: apps
+      kind: "*"
+    - group: batch
+      kind: "*"
+    - group: autoscaling
+      kind: HorizontalPodAutoscaler
+    - group: policy
+      kind: PodDisruptionBudget
+    - group: networking.k8s.io
+      kind: "*"
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+    - group: rbac.authorization.k8s.io
+      kind: "*"
+    - group: monitoring.coreos.com
+      kind: "*"
+    - group: external-secrets.io
+      kind: ExternalSecret
+    - group: argoproj.io
+      kind: Rollout
+    - group: argoproj.io
+      kind: AnalysisTemplate
+  namespaceResourceBlacklist:
+    # This project must never create a ResourceQuota or a LimitRange: those are
+    # the cluster operator's controls over this namespace, and a chart that can
+    # rewrite its own quota does not have one.
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: LimitRange
+  roles:
+    - name: release-engineer
+      description: May sync production. Read-only everywhere else.
+      policies:
+        - p, proj:usslp:release-engineer, applications, sync, usslp/usslp-prod-*, allow
+        - p, proj:usslp:release-engineer, applications, get, usslp/*, allow
+        - p, proj:usslp:release-engineer, applications, action/argoproj.io/Rollout/promote-full, usslp/usslp-prod-*, allow
+      groups:
+        - usslp:release-engineers
+    - name: on-call
+      description: >-
+        May abort a rollout and roll back, at any hour, without a second
+        approval. An on-call engineer who has to find someone to approve a
+        rollback is an on-call engineer who will not roll back.
+      policies:
+        - p, proj:usslp:on-call, applications, get, usslp/*, allow
+        - p, proj:usslp:on-call, applications, action/argoproj.io/Rollout/abort, usslp/*, allow
+        - p, proj:usslp:on-call, applications, action/argoproj.io/Rollout/undo, usslp/*, allow
+      groups:
+        - usslp:on-call

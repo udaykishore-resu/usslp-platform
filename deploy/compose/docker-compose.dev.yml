@@ -1,0 +1,598 @@
+# USSLP — dev profile.
+#
+# The pure-Go stack: nothing here but binaries out of this repository. No Kafka,
+# no Postgres, no ClickHouse, no EMQX. Every service uses the in-tree embedded
+# implementations — pkg/eventlog for the event stream, pkg/kvstore for state,
+# pkg/mqtt for the broker — so the whole thing starts in seconds on a laptop.
+#
+# Run it:
+#   docker compose -f deploy/compose/docker-compose.dev.yml up --build
+#
+# Read deploy/compose/README.md before drawing conclusions from it. Two things
+# in particular are not what they look like:
+#
+#   1. pkg/eventlog is an *embedded, in-process* log. Its consumer-group
+#      coordination lives in memory (platform/pkg/eventlog/consumer.go), so two
+#      processes must not share one log directory. Each service below therefore
+#      gets its own event-log volume, which means the UIG's `price-updates`
+#      records do NOT reach the Label Service's consumer in this profile. The
+#      services are wired together over MQTT and HTTP, which is real; the event
+#      stream is per-process, which is a property of the embedded log, not a
+#      configuration mistake. A shared bus is what the Kafka adapter behind
+#      pkg/eventbus.Bus is for — see the prod-like profile.
+#
+#   2. `cloud-broker` runs the `sgu` binary for one reason only: the repository
+#      has no standalone broker command, and the SGU embeds pkg/mqtt's broker.
+#      It stands in for EMQX so that the store gateway's cloud bridge has
+#      something to bridge to. In prod-like and in production this is EMQX.
+#
+# Host port map, from the platform's dev conventions:
+#
+#   api-gateway       8080 / 9080     (note: its admin default is :9080, not
+#                                      :9090 — it overrides the shared default)
+#   uig               8081 / 9081
+#   label-service     8082 / 9082
+#   device-registry   8083 / 9083     opt-in, needs a PKI hierarchy
+#   ota-service       8084 / 9084
+#   pricing-service   8085 / 9085
+#   promotion-service 8086 / 9086
+#   analytics-service 8087 / 9087
+#   SGU               1883 broker, 8090 diagnostics, 9090 admin
+#   cloud broker      1884
+
+name: usslp-dev
+
+# ---------------------------------------------------------------------------
+# Shared fragments
+# ---------------------------------------------------------------------------
+x-usslp-build: &usslp-build
+  context: ../..
+  dockerfile: deploy/docker/Dockerfile
+  # The `probe` stage is the runtime image plus a static busybox, purely so that
+  # compose has something to exec for a healthcheck. Images pushed to a registry
+  # are built from the `runtime` stage and have no shell at all.
+  target: probe
+
+x-usslp-common: &usslp-common
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 45s
+  # Longer than every service's own drain (20s for the platform services, 15s
+  # for the SEC): SIGTERM must have time to finish before SIGKILL arrives.
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-usslp-env: &usslp-env
+  USSLP_ENVIRONMENT: dev
+  USSLP_REGION: local
+  USSLP_LOG_LEVEL: debug
+  USSLP_LOG_FORMAT: text
+  USSLP_ENABLE_PPROF: "true"
+  USSLP_TRACE_SAMPLE_ONE_IN: "1"
+
+x-admin-healthcheck: &admin-healthcheck
+  test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "-", "http://127.0.0.1:9090/readyz"]
+  interval: 5s
+  timeout: 3s
+  retries: 12
+  start_period: 15s
+
+services:
+  # -------------------------------------------------------------------------
+  # cloud-broker — the SGU binary used solely for its embedded MQTT broker.
+  #
+  # It has no cloud of its own (USSLP_CLOUD_BROKER_URL unset), so it logs
+  # "no cloud broker configured: this store will run permanently autonomous"
+  # and simply serves the broker. That warning is expected here.
+  # -------------------------------------------------------------------------
+  cloud-broker:
+    <<: *usslp-common
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: sgu
+        CMD_PATH: ./edge/cmd/sgu
+        VERSION: dev
+    image: usslp/sgu:dev
+    environment:
+      <<: *usslp-env
+      USSLP_SGU_ID: cloud-hub
+      USSLP_STORE_ID: cloud-hub
+      USSLP_TENANT_ID: demo-retail
+      USSLP_BROKER_ADDR: 0.0.0.0:1883
+      USSLP_GATEWAY_ADDR: 0.0.0.0:8080
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_DATA_DIR: /var/lib/usslp
+    ports:
+      - "1884:1883"   # cloud MQTT broker
+      - "9091:9090"   # obs admin
+    volumes:
+      - cloud-broker-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+
+  # -------------------------------------------------------------------------
+  # store-gateway — a real Store Gateway Unit: store broker, offline brain,
+  # disk-backed upstream queue, and the cloud bridge.
+  # -------------------------------------------------------------------------
+  store-gateway:
+    <<: *usslp-common
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: sgu
+        CMD_PATH: ./edge/cmd/sgu
+        VERSION: dev
+    image: usslp/sgu:dev
+    depends_on:
+      cloud-broker:
+        condition: service_healthy
+    environment:
+      <<: *usslp-env
+      USSLP_SGU_ID: sgu-0001
+      USSLP_STORE_ID: store-0001
+      USSLP_TENANT_ID: demo-retail
+      USSLP_BROKER_ADDR: 0.0.0.0:1883
+      USSLP_GATEWAY_ADDR: 0.0.0.0:8080
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_CLOUD_BROKER_URL: tcp://cloud-broker:1883
+      USSLP_DATA_DIR: /var/lib/usslp
+      # Fast WAN detection so that `docker compose pause cloud-broker` flips the
+      # store into autonomous mode inside a demo rather than inside a minute.
+      USSLP_PROBE_INTERVAL: 2s
+      USSLP_PROBE_TIMEOUT: 1s
+      USSLP_WAN_FAIL_THRESHOLD: "2"
+      USSLP_WAN_FAIL_FOR: 4s
+      USSLP_WAN_RECOVER_THRESHOLD: "2"
+      USSLP_WAN_RECOVER_FOR: 4s
+      USSLP_QUEUE_MAX_ENTRIES: "50000"
+      USSLP_QUEUE_MAX_MB: "256"
+    ports:
+      - "1883:1883"   # store MQTT broker
+      - "8090:8080"   # SGU diagnostics (/status, /mode, /queue, /secs, /labels…)
+      - "9090:9090"   # obs admin
+    volumes:
+      - store-gateway-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+
+  # -------------------------------------------------------------------------
+  # uig — Universal Integration Gateway. Owns 50 ms of the 3-second price path.
+  # -------------------------------------------------------------------------
+  uig:
+    <<: *usslp-common
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: uig
+        CMD_PATH: ./platform/cmd/uig
+        VERSION: dev
+    image: usslp/uig:dev
+    environment:
+      <<: *usslp-env
+      USSLP_UIG_ADDR: 0.0.0.0:8080
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_UIG_EVENTLOG_DIR: /var/lib/usslp/eventlog
+      USSLP_UIG_STATE_DIR: /var/lib/usslp/uig-state
+      # A dev operator token. The operator endpoints (/v1/bindings,
+      # /v1/deliveries, /v1/replay) refuse to serve without one.
+      USSLP_UIG_OPERATOR_TOKEN: dev-operator-token
+      USSLP_UIG_DEDUPE_WINDOW: 24h
+      USSLP_UIG_SHUTDOWN_GRACE: 20s
+    ports:
+      - "8081:8080"
+      - "9081:9090"
+    volumes:
+      - uig-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+
+  # -------------------------------------------------------------------------
+  # label-service — attestation, fan-out and delivery confirmation.
+  #
+  # With no USSLP_PRICE_AUTHORITY_DIR it generates an ephemeral Ed25519 signing
+  # key and says so loudly. Attestations signed with it verify against no key
+  # ring in the field, which is exactly right for a laptop and exactly wrong
+  # anywhere else.
+  # -------------------------------------------------------------------------
+  label-service:
+    <<: *usslp-common
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: label-service
+        CMD_PATH: ./platform/cmd/label-service
+        VERSION: dev
+    image: usslp/label-service:dev
+    depends_on:
+      cloud-broker:
+        condition: service_healthy
+    environment:
+      <<: *usslp-env
+      USSLP_LABEL_HTTP_ADDR: 0.0.0.0:8080
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_MQTT_BROKER_URL: tcp://cloud-broker:1883
+      USSLP_DEFAULT_CURRENCY: USD
+      USSLP_TENANT_RATE_PER_SECOND: "5000"
+      USSLP_TENANT_BURST: "10000"
+      USSLP_SCHEDULER_TICK: 1s
+    ports:
+      - "8082:8080"
+      - "9082:9090"
+    volumes:
+      - label-service-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+
+  # -------------------------------------------------------------------------
+  # ota-service — firmware rollouts.
+  #
+  # USSLP_OTA_SIGNING_KEYS is unset, so the service starts and logs
+  # "no firmware signing keys are configured; every artifact upload will be
+  # refused". Rollout planning, cohorts and quiet hours are all exercisable;
+  # uploading an artifact is not, until a key is supplied.
+  # -------------------------------------------------------------------------
+  ota-service:
+    <<: *usslp-common
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: ota-service
+        CMD_PATH: ./platform/cmd/ota-service
+        VERSION: dev
+    image: usslp/ota-service:dev
+    depends_on:
+      cloud-broker:
+        condition: service_healthy
+    environment:
+      <<: *usslp-env
+      USSLP_OTA_HTTP_ADDR: 0.0.0.0:8080
+      USSLP_OTA_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_OTA_DATA_DIR: /var/lib/usslp/ota
+      USSLP_OTA_ARTIFACT_DIR: /var/lib/usslp/firmware
+      USSLP_EVENTLOG_DIR: /var/lib/usslp/eventlog
+      USSLP_MQTT_URL: tcp://cloud-broker:1883
+      USSLP_MQTT_CLIENT_ID: ota-service-dev
+      USSLP_OTA_TICK_INTERVAL: 10s
+    ports:
+      - "8084:8080"
+      - "9084:9090"
+    volumes:
+      - ota-service-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+
+  # -------------------------------------------------------------------------
+  # pricing-service — the AI pricing tier.
+  #
+  # Its own budgets are tighter than anything else in the platform: the
+  # usslp_pricing_tier_seconds histogram's buckets straddle 10 ms for Tier 1 and
+  # 15 ms for Tier 2, because a histogram whose buckets do not bracket the SLO
+  # cannot answer whether the SLO was met.
+  # -------------------------------------------------------------------------
+  pricing-service:
+    <<: *usslp-common
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: pricing-service
+        CMD_PATH: ./platform/cmd/pricing-service
+        VERSION: dev
+    image: usslp/pricing-service:dev
+    environment:
+      <<: *usslp-env
+      USSLP_PRICING_HTTP_ADDR: 0.0.0.0:8080
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_DEFAULT_CURRENCY: USD
+    ports:
+      - "8085:8080"
+      - "9085:9090"
+    volumes:
+      - pricing-service-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+
+  # -------------------------------------------------------------------------
+  # promotion-service — promotion lifecycle and zone fan-out.
+  # -------------------------------------------------------------------------
+  promotion-service:
+    <<: *usslp-common
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: promotion-service
+        CMD_PATH: ./platform/cmd/promotion-service
+        VERSION: dev
+    image: usslp/promotion-service:dev
+    environment:
+      <<: *usslp-env
+      USSLP_PROMOTION_HTTP_ADDR: 0.0.0.0:8080
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_DATA_DIR: /var/lib/usslp
+      # Store-local time zones matter here: a promotion that activates at
+      # midnight activates at 25 different instants across a chain.
+      USSLP_PROMOTION_DEFAULT_ZONE: UTC
+      USSLP_PROMOTION_SWEEP_INTERVAL: 10s
+    ports:
+      - "8086:8080"
+      - "9086:9090"
+    volumes:
+      - promotion-service-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+
+  # -------------------------------------------------------------------------
+  # analytics-service — the columnar store, the reports and SLO attainment.
+  #
+  # It consumes four streams into its own column-oriented store. In this profile
+  # that store is its own eventlog directory, so — like every other service here
+  # — it sees only what it produces itself: pkg/eventlog keeps consumer-group
+  # coordination in memory and two processes must not share one log directory.
+  # See section 2 of deploy/README.md. The service starts, serves its reports
+  # and answers the gateway; the rows in them come from the prod-like profile or
+  # from `usslpd`, where one shared log makes the cross-service stream real.
+  # -------------------------------------------------------------------------
+  analytics-service:
+    <<: *usslp-common
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: analytics-service
+        CMD_PATH: ./platform/cmd/analytics-service
+        VERSION: dev
+    image: usslp/analytics-service:dev
+    environment:
+      <<: *usslp-env
+      USSLP_ANALYTICS_HTTP_ADDR: 0.0.0.0:8080
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_DATA_DIR: /var/lib/usslp
+      # Short intervals so a developer sees a block sealed and a retention pass
+      # run inside one session rather than inside one production day.
+      USSLP_ANALYTICS_FLUSH_INTERVAL: 10s
+      USSLP_ANALYTICS_RETENTION_INTERVAL: 5m
+    ports:
+      - "8087:8080"
+      - "9087:9090"
+    volumes:
+      - analytics-service-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+
+  # -------------------------------------------------------------------------
+  # api-gateway — the front door.
+  #
+  # Two things to know about its configuration:
+  #
+  #   1. Its admin port default is :9080, not the :9090 every other binary
+  #      uses. It is pinned explicitly below rather than relied on.
+  #
+  #   2. USSLP_UIG_ADDR here means "the URL of the UIG upstream". The uig binary
+  #      reads a variable of the SAME NAME as its own listen address
+  #      (platform/cmd/uig/service.go). They never collide because each process
+  #      has its own environment, but a shared env file for both would break
+  #      one of them in a way that is very hard to see.
+  #
+  # Every upstream below is a service in this profile, analytics included, so an
+  # open breaker on any of them is a real fault rather than an expected one.
+  # usslp_gateway_breaker_state reports which.
+  # -------------------------------------------------------------------------
+  api-gateway:
+    <<: *usslp-common
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: api-gateway
+        CMD_PATH: ./platform/cmd/api-gateway
+        VERSION: dev
+    image: usslp/api-gateway:dev
+    depends_on:
+      uig:
+        condition: service_healthy
+      label-service:
+        condition: service_healthy
+      ota-service:
+        condition: service_healthy
+    environment:
+      <<: *usslp-env
+      USSLP_GATEWAY_HTTP_ADDR: 0.0.0.0:8080
+      USSLP_ADMIN_ADDR: 0.0.0.0:9080
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_UIG_ADDR: http://uig:8080
+      USSLP_LABEL_SERVICE_ADDR: http://label-service:8080
+      USSLP_DEVICE_REGISTRY_ADDR: http://device-registry:8080
+      USSLP_OTA_SERVICE_ADDR: http://ota-service:8080
+      USSLP_PRICING_SERVICE_ADDR: http://pricing-service:8080
+      USSLP_PROMOTION_SERVICE_ADDR: http://promotion-service:8080
+      USSLP_ANALYTICS_SERVICE_ADDR: http://analytics-service:8080
+      # A dev bootstrap tenant so there is an API key to call with. There is no
+      # JWKS here, so JWT auth is off and API-key auth is the only path.
+      USSLP_BOOTSTRAP_TENANT: demo-retail
+    ports:
+      - "8080:8080"
+      - "9080:9080"
+    volumes:
+      - api-gateway-data:/var/lib/usslp
+    healthcheck:
+      # The gateway's admin port is 9080, not 9090, so it cannot share the
+      # anchor every other service uses.
+      test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "-", "http://127.0.0.1:9080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
+  # -------------------------------------------------------------------------
+  # labelsim — a simulated store: controllers, Zigbee mesh, E-Ink labels.
+  #
+  # It is the only thing in this profile that produces label telemetry and
+  # delivery acknowledgements, so it is what makes the fleet-health dashboard
+  # show anything at all.
+  # -------------------------------------------------------------------------
+  labelsim:
+    <<: *usslp-common
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: labelsim
+        CMD_PATH: ./edge/cmd/labelsim
+        VERSION: dev
+    image: usslp/labelsim:dev
+    depends_on:
+      store-gateway:
+        condition: service_healthy
+    environment:
+      <<: *usslp-env
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_SIM_HTTP_ADDR: 0.0.0.0:8080
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_STORE_ID: store-0001
+      USSLP_TENANT_ID: demo-retail
+      USSLP_GATEWAY_BROKER_URL: tcp://store-gateway:1883
+      USSLP_CONTROLLERS: "4"
+      USSLP_LABELS_PER_CONTROLLER: "250"
+      USSLP_ZONE_LENGTH_M: "24"
+      USSLP_SIM_SPEED: "60"
+      USSLP_TELEMETRY_INTERVAL: 30s
+    ports:
+      - "8099:8080"   # /store status page
+      - "9099:9090"
+    volumes:
+      - labelsim-data:/var/lib/usslp
+    healthcheck: *admin-healthcheck
+
+  # -------------------------------------------------------------------------
+  # device-registry — opt-in, because it cannot start without a certificate
+  # hierarchy.
+  #
+  # platform/cmd/device-registry calls pki.Load(USSLP_REGISTRY_PKI_DIR) and
+  # refuses to start if the directory is not a hierarchy written by
+  # pki.Hierarchy.Save — which is correct: a registry that enrolled devices
+  # without verifying them would be worse than no registry. The repository does
+  # not currently ship a key-ceremony command (tools/ is empty), so there is no
+  # way to produce that directory from this compose file. Populate ./pki
+  # yourself (pki.Bootstrap + Save) and then:
+  #
+  #   docker compose -f deploy/compose/docker-compose.dev.yml \
+  #     --profile registry up device-registry
+  # -------------------------------------------------------------------------
+  device-registry:
+    <<: *usslp-common
+    profiles: ["registry"]
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: device-registry
+        CMD_PATH: ./platform/cmd/device-registry
+        VERSION: dev
+    image: usslp/device-registry:dev
+    depends_on:
+      cloud-broker:
+        condition: service_healthy
+    environment:
+      <<: *usslp-env
+      USSLP_REGISTRY_HTTP_ADDR: 0.0.0.0:8080
+      USSLP_REGISTRY_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_REGISTRY_DATA_DIR: /var/lib/usslp/registry
+      USSLP_EVENTLOG_DIR: /var/lib/usslp/eventlog
+      USSLP_REGISTRY_PKI_DIR: /etc/usslp/pki
+      USSLP_MQTT_URL: tcp://cloud-broker:1883
+      USSLP_MQTT_CLIENT_ID: device-registry-dev
+      # Development seeding lets this process mint device identities. It is off
+      # by default in the binary and must stay off anywhere real.
+      USSLP_REGISTRY_ENABLE_SEED: "true"
+      USSLP_REGISTRY_SWEEP_INTERVAL: 10s
+    ports:
+      - "8083:8080"
+      - "9083:9090"
+    volumes:
+      - device-registry-data:/var/lib/usslp
+      - ./pki:/etc/usslp/pki:ro
+    healthcheck: *admin-healthcheck
+
+  # -------------------------------------------------------------------------
+  # sec — a real Shelf Edge Controller process, as opposed to labelsim's
+  # simulated ones. Opt-in for the same reason as the registry: the binary
+  # declares USSLP_KEYRING_FILE Required, and the key ring is produced by the
+  # key ceremony this repository does not yet ship a command for.
+  #
+  #   docker compose -f deploy/compose/docker-compose.dev.yml \
+  #     --profile edge up sec
+  # -------------------------------------------------------------------------
+  sec:
+    <<: *usslp-common
+    profiles: ["edge"]
+    build:
+      <<: *usslp-build
+      args:
+        SERVICE: sec
+        CMD_PATH: ./edge/cmd/sec
+        VERSION: dev
+    image: usslp/sec:dev
+    depends_on:
+      store-gateway:
+        condition: service_healthy
+    environment:
+      <<: *usslp-env
+      USSLP_ADMIN_ADDR: 0.0.0.0:9090
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_SEC_ID: sec-0001
+      USSLP_STORE_ID: store-0001
+      USSLP_TENANT_ID: demo-retail
+      USSLP_GATEWAY_BROKER_URL: tcp://store-gateway:1883
+      USSLP_KEYRING_FILE: /etc/usslp/pki/keyring.json
+      USSLP_ZONE_LABELS: "240"
+      USSLP_ZONE_LENGTH_M: "24"
+      USSLP_MESH_HEALING: predictive
+      USSLP_HEARTBEAT_INTERVAL: 10s
+      USSLP_TELEMETRY_INTERVAL: 30s
+    ports:
+      - "9092:9090"
+    volumes:
+      - sec-data:/var/lib/usslp
+      - ./pki:/etc/usslp/pki:ro
+    healthcheck: *admin-healthcheck
+
+  # -------------------------------------------------------------------------
+  # prometheus — scrapes every admin port above. Optional; the services are
+  # perfectly usable without it.
+  #
+  #   docker compose -f deploy/compose/docker-compose.dev.yml \
+  #     --profile obs up prometheus
+  # -------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    profiles: ["obs"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+    ports:
+      - "9190:9090"
+    volumes:
+      - ./config/prometheus-dev.yml:/etc/prometheus/prometheus.yml:ro
+      - ../observability/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-dev-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+volumes:
+  api-gateway-data:
+  analytics-service-data:
+  pricing-service-data:
+  promotion-service-data:
+  cloud-broker-data:
+  store-gateway-data:
+  uig-data:
+  label-service-data:
+  ota-service-data:
+  labelsim-data:
+  device-registry-data:
+  sec-data:
+  prometheus-dev-data:

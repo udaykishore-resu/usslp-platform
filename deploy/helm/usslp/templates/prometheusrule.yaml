@@ -1,0 +1,105 @@
+{{- if .Values.monitoring.prometheusRule.enabled }}
+{{/*
+The SLO and component rules are NOT written here.
+
+They live in deploy/observability/prometheus/rules/ as plain Prometheus rule
+files, because that is the form a `promtool check rules` and a `promtool test
+rules` can consume and the form the compose profiles mount directly. A copy is
+generated into this chart's files/rules/ by `make helm-sync-rules`, embedded
+below with .Files.Glob, and `make verify-rules` fails CI if the two have
+drifted. One source, two consumers, and a check that keeps them honest.
+
+What IS written here is the set of alerts about *this chart's own objects* —
+rollouts, autoscalers, budgets. They belong to the chart because they are
+statements about how the chart deployed the workload, and they are meaningless
+without it.
+*/}}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "usslp.fullname" . }}-slo
+  labels:
+    {{- include "usslp.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+spec:
+  groups:
+    {{- range $path, $_ := .Files.Glob "files/rules/*.yaml" }}
+    {{- $doc := $.Files.Get $path | fromYaml }}
+    {{- toYaml $doc.groups | nindent 4 }}
+    {{- end }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "usslp.fullname" . }}-workload
+  labels:
+    {{- include "usslp.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+spec:
+  groups:
+    - name: usslp.workload
+      rules:
+        {{- range $name, $svc := .Values.services }}
+        {{- if $svc.enabled }}
+        - alert: USSLPWorkloadBelowFloor
+          # Below the replica floor the capacity model was written against. Not
+          # "below desired": a Deployment at 5 of 6 during a rollout is fine,
+          # and this fires only when it stays there.
+          expr: |
+            kube_deployment_status_replicas_available{deployment="{{ include "usslp.fullname" $ }}-{{ $name }}"}
+            < {{ $svc.replicas.min }}
+          for: 15m
+          labels:
+            severity: warning
+            component: {{ $name }}
+          annotations:
+            summary: "{{ $name }} has been below its replica floor of {{ $svc.replicas.min }} for 15 minutes"
+        {{- if $svc.hpa.enabled }}
+        - alert: USSLPAutoscalerAtCeiling
+          # An HPA pinned at max is the platform telling you the capacity model
+          # is wrong. It is not an incident by itself — the service is serving —
+          # but it means there is no headroom left for the next spike.
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas{horizontalpodautoscaler="{{ include "usslp.fullname" $ }}-{{ $name }}"}
+            >=
+            kube_horizontalpodautoscaler_spec_max_replicas{horizontalpodautoscaler="{{ include "usslp.fullname" $ }}-{{ $name }}"}
+          for: 30m
+          labels:
+            severity: warning
+            component: {{ $name }}
+          annotations:
+            summary: "{{ $name }} has been at its autoscaler ceiling of {{ $svc.replicas.max }} for 30 minutes"
+            description: >-
+              There is no headroom left. Raise replicas.max in the environment
+              values file, or find out why each pod is doing less work than the
+              capacity model assumed.
+        {{- end }}
+        - alert: USSLPDisruptionBudgetBlocking
+          # A PDB with no allowed disruptions blocks node drains, which blocks
+          # the cluster autoscaler and node upgrades. It is usually correct and
+          # temporary; sustained, it means a node cannot be drained at all.
+          expr: |
+            kube_poddisruptionbudget_status_current_healthy{poddisruptionbudget="{{ include "usslp.fullname" $ }}-{{ $name }}"}
+            <=
+            kube_poddisruptionbudget_status_desired_healthy{poddisruptionbudget="{{ include "usslp.fullname" $ }}-{{ $name }}"}
+          for: 1h
+          labels:
+            severity: info
+            component: {{ $name }}
+          annotations:
+            summary: "{{ $name }}'s PodDisruptionBudget has allowed no disruptions for an hour"
+            description: >-
+              Node drains and cluster-autoscaler scale-down are blocked on this
+              workload. Check whether it is stuck below its floor.
+        {{- end }}
+        {{- end }}
+{{- end }}

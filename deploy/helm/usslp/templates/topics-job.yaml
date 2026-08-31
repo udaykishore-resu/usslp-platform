@@ -1,0 +1,147 @@
+{{- if .Values.topicProvisioning.enabled }}
+---
+# Kafka topic provisioning.
+#
+# The stream catalogue is defined once, in platform/pkg/canon/topics.go, so that
+# the local development broker, the docker-compose profile and the Terraform
+# that provisions MSK all derive from one source of truth. This Job is the
+# Kubernetes end of that: the values in .Values.topicProvisioning.streams are
+# transcribed from canon.AllStreams() and CI checks them against it
+# (`make verify-topics`).
+#
+# --if-not-exists, never --alter. Changing a partition count re-maps every key
+# to a different partition and silently destroys the per-key ordering the whole
+# platform is built on — which is why pkg/eventlog refuses it outright with
+# ErrPartitionsChanged rather than applying it. A partition-count change is a
+# migration with a dual-write, not a Helm upgrade.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "usslp.fullname" . }}-topics
+  labels:
+    {{- include "usslp.labels" . | nindent 4 }}
+  annotations:
+    # A Helm hook, so it runs before the services that consume the topics.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    # And an ArgoCD PreSync hook, because ArgoCD does not run Helm hooks.
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "-5"
+spec:
+  backoffLimit: 6
+  # An hour. Creating 2,048 partitions on label-telemetry against a cold MSK
+  # cluster is not fast, and a Job that gives up halfway leaves a catalogue
+  # half-provisioned that the next run has to reconcile.
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "usslp.labels" . | nindent 8 }}
+        app.kubernetes.io/component: topics
+      annotations:
+        # No sidecar: a Job whose sidecar never exits never completes.
+        sidecar.istio.io/inject: "false"
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ include "usslp.fullname" . }}-topics
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: topics
+          image: {{ .Values.topicProvisioning.image.registry }}/{{ .Values.topicProvisioning.image.repository }}:{{ .Values.topicProvisioning.image.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          env:
+            - name: BOOTSTRAP
+              value: {{ .Values.topicProvisioning.bootstrapServers | quote }}
+            - name: RF
+              value: {{ .Values.topicProvisioning.replicationFactor | quote }}
+            - name: MIN_ISR
+              value: {{ .Values.topicProvisioning.minInsyncReplicas | quote }}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              # Wait for the cluster rather than failing on a cold start. The
+              # Job is a PreSync hook, so it may well be the first thing to
+              # touch a freshly provisioned MSK cluster.
+              for i in $(seq 1 60); do
+                if kafka-broker-api-versions.sh --bootstrap-server "$BOOTSTRAP" >/dev/null 2>&1; then
+                  break
+                fi
+                echo "waiting for $BOOTSTRAP ($i/60)"
+                sleep 5
+              done
+
+              create() {
+                local name=$1 parts=$2 retention_hours=$3 compact=$4
+                local -a cfg
+                if [ "$compact" = "true" ]; then
+                  # Compacted: the latest value per key, kept forever. This is
+                  # how a restarting service rebuilds its read model without
+                  # replaying seven days of history, so it must never also
+                  # carry a time retention.
+                  cfg=(--config cleanup.policy=compact
+                       --config retention.ms=-1
+                       --config min.cleanable.dirty.ratio=0.1)
+                else
+                  cfg=(--config retention.ms=$(( retention_hours * 3600000 )))
+                fi
+                # acks=all plus min.insync.replicas is the platform's durability
+                # guarantee: the UIG acknowledges a POS only once the change is
+                # durable, and "durable" has to mean more than one broker.
+                cfg+=(--config min.insync.replicas="$MIN_ISR")
+                echo "==> $name  partitions=$parts  rf=$RF"
+                kafka-topics.sh --bootstrap-server "$BOOTSTRAP" \
+                  --create --if-not-exists \
+                  --topic "$name" --partitions "$parts" --replication-factor "$RF" \
+                  "${cfg[@]}"
+              }
+
+              {{- range .Values.topicProvisioning.streams }}
+              create {{ .name }} {{ .partitions }} {{ .retentionHours }} {{ .compacted }}
+              {{- end }}
+
+              echo "--- catalogue ---"
+              kafka-topics.sh --bootstrap-server "$BOOTSTRAP" --list
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "usslp.fullname" . }}-topics
+  labels:
+    {{- include "usslp.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/sync-wave: "-6"
+    {{- if .Values.topicProvisioning.iamRoleArn }}
+    # MSK with IAM authentication. The role needs kafka-cluster:Connect,
+    # CreateTopic, DescribeTopic and AlterTopicDynamicConfiguration on the
+    # cluster — see deploy/terraform/modules/iam-irsa.
+    eks.amazonaws.com/role-arn: {{ .Values.topicProvisioning.iamRoleArn | quote }}
+    {{- end }}
+automountServiceAccountToken: true
+{{- end }}

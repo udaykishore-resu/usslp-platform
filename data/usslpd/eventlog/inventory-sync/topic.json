@@ -1,0 +1,7 @@
+{
+  "name": "inventory-sync",
+  "partitions": 4,
+  "retention_hours": 336,
+  "compacted": false,
+  "description": "Stock level changes from POS/ERP"
+}

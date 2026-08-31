@@ -1,0 +1,26 @@
+{{- range $name, $svc := .Values.services }}
+{{- if and $svc.enabled $svc.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "usslp.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "usslp.serviceLabels" (dict "ctx" $ "name" $name "svc" $svc) | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: {{ default "Deployment" $svc.kind }}
+    name: {{ include "usslp.fullname" $ }}-{{ $name }}
+  minReplicas: {{ $svc.replicas.min }}
+  maxReplicas: {{ $svc.replicas.max }}
+  metrics:
+    {{- toYaml $svc.hpa.metrics | nindent 4 }}
+  {{- with $svc.hpa.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

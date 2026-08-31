@@ -1,0 +1,134 @@
+# USSLP — production, ap-south-1 (India data localisation).
+#
+# Structurally the same as eu-west-1: residency enforced, a region-local secret
+# store, region-pinned archives. The differences that are genuinely
+# India-specific:
+#
+#  1. ap-south-1 has three availability zones and no more, so the zone spread
+#     constraint has exactly three buckets. maxSkew 1 across three zones with a
+#     six-pod floor gives two per zone, which is what the label-service PDB
+#     minimum of 4 assumes: lose a zone, keep four.
+#
+#  2. The region is further from the primary than eu-west-1 is, so anything
+#     that crosses regions is more expensive in latency. Nothing on the price
+#     path does — the whole point of the tier model is that a store's labels
+#     are served from inside the store — but cross-region control-plane calls
+#     are worth avoiding, which is why the secret store is local.
+#
+#  3. Retention. The audit-log stream's 365-day retention comes from
+#     canon.StreamAudit and is the same in every region; the S3 archive behind
+#     it is region-pinned in deploy/terraform, and the object-lock retention
+#     there is the parameter to change if the statutory period differs.
+#
+# The SLOs are the same. An Indian retailer gets the same three-second price
+# path.
+
+global:
+  region: ap-south-1
+  environment: prod
+  imageRegistry: ghcr.io/usslp
+  clusterDomain: cluster.local
+  dataResidency:
+    enforced: true
+    allowedTenantClasses:
+      - in
+
+image:
+  pullPolicy: IfNotPresent
+  tag: ""
+
+externalSecrets:
+  enabled: true
+  refreshInterval: 1h
+  secretStoreRef:
+    name: usslp-ap-south-1-store
+    kind: ClusterSecretStore
+  remotePathPrefix: usslp/prod/ap-south-1
+
+istio:
+  enabled: true
+  holdApplicationUntilProxyStarts: true
+
+networkPolicy:
+  enabled: true
+  dnsNamespace: kube-system
+  posSourceCIDRs: []
+
+ingress:
+  enabled: true
+  className: nginx
+  host: api.ap-south-1.usslp.REPLACE-ME.example
+  annotations:
+    cert-manager.io/cluster-issuer: usslp-public-issuer
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+  tls:
+    enabled: true
+    secretName: usslp-prod-aps1-tls
+
+gatewayAPI:
+  enabled: false
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+  prometheusRule:
+    enabled: true
+
+topicProvisioning:
+  enabled: true
+  bootstrapServers: "REPLACE-ME.kafka.ap-south-1.amazonaws.com:9098"
+  replicationFactor: 3
+  minInsyncReplicas: 2
+  iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-aps1-topics"
+
+priorityClasses:
+  create: true
+
+topologySpread:
+  enabled: true
+  zone:
+    maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+  node:
+    maxSkew: 2
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+
+nodeSelector:
+  usslp.io/workload: platform
+
+tolerations:
+  - key: usslp.io/dedicated
+    operator: Equal
+    value: platform
+    effect: NoSchedule
+
+services:
+  label-service:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-aps1-label-service"
+  pos-integration-gw:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-aps1-pos-integration-gw"
+  device-registry:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-aps1-device-registry"
+  ota-service:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-aps1-ota-service"
+  mqtt-broker:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-aps1-mqtt-broker"
+  kafka-connect:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-aps1-kafka-connect"
+  api-gateway:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-aps1-api-gateway"
+  pricing-ai-service:
+    # The workload key is the capacity table's name; the image is
+    # `pricing-service`, which is what platform/cmd/pricing-service builds, and
+    # the metric `service` label is "pricing-service" too. Three names for one
+    # thing, each correct in its own place.
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-aps1-pricing-ai-service"
+  promotion-service:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-aps1-promotion-service"
+
+  analytics-service:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-aps1-analytics-service"

@@ -1,0 +1,51 @@
+# USSLP edge self-update schedule.
+#
+# ---------------------------------------------------------------------------
+# The randomised delay is the most important line in this file
+# ---------------------------------------------------------------------------
+# A fleet of 100,000 stores that all check for an update at 03:00 is a
+# 100,000-way thundering herd against the artifact endpoint, and — far worse —
+# a fleet that all applies the same bad update within the same minute. There is
+# then no window in which somebody notices the first few hundred failing and
+# stops the rest.
+#
+# RandomizedDelaySec spreads the checks across four hours. At 100,000 stores
+# that is roughly seven per second, and a bad update reaches 1% of the fleet
+# over about two and a half minutes — long enough for the OTA service's own
+# failure threshold to trip and for a human to pull the version pin.
+#
+# The pin is the other half of the safety. update.sh installs the version named
+# in /etc/usslp/update.env's USSLP_TARGET_VERSION, which is fetched from the
+# fleet endpoint rather than being "whatever is newest". Stopping a rollout is
+# changing one value centrally, not racing 100,000 timers.
+
+[Unit]
+Description=USSLP edge self-update schedule
+Documentation=https://github.com/usslp/usslp/blob/main/deploy/edge/RUNBOOK.md
+
+[Timer]
+# 02:00 local time, plus up to four hours of jitter. Local rather than UTC so
+# that "the middle of the night" means the middle of the night in the store's
+# own time zone — a 24-hour hypermarket in Mumbai and one in Dublin do not share
+# a quiet period.
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=4h
+
+# Deterministic per host, so a given store's slot is stable across reboots.
+# Without this the jitter is re-rolled every boot, and a store that reboots
+# often would eventually draw a slot in the middle of its trading day.
+FixedRandomDelay=true
+
+# If the box was off at its slot — a store that closes, a power cut — run once
+# after boot rather than skipping the day entirely.
+Persistent=true
+
+# Never while the store is trading. AccuracySec is coarse deliberately: a
+# one-second-accurate timer wakes the CPU on schedule, and these boxes are
+# fanless.
+AccuracySec=1h
+
+Unit=usslp-update.service
+
+[Install]
+WantedBy=timers.target

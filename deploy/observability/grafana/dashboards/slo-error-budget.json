@@ -1,0 +1,433 @@
+{
+  "uid": "usslp-slo-budget",
+  "title": "USSLP — SLOs and Error Budgets",
+  "description": "The seven platform SLOs, their remaining 30-day error budgets, and the burn rates the alerts in deploy/observability/prometheus/rules/slo-alerts.yaml fire on. This is the board a release decision is made from: a service with 4% of its month left should not be taking a risky deploy.",
+  "tags": ["usslp", "slo", "error-budget"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "1m",
+  "time": { "from": "now-30d", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "usslp-prometheus" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "How to read this board",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Burn rate = observed error ratio / error budget.** A burn rate of 1 exactly exhausts the 30-day budget in 30 days. A burn rate of 14.4 exhausts 2% of it in one hour.\n\nThe alerts pair a long window with a short one — 14.4x over 1h confirmed by 5m, 6x over 6h confirmed by 30m — because the long window says *this is real* and the short window is what makes the alert **stop** once the incident is over. A single-window alert keeps paging for an hour after resolution, which is how people learn to ignore the resolution notification too.\n\n| SLO | objective | budget | fast-burn threshold |\n|---|---|---|---|\n| Price update within 3 s | 99% | 1% | 14.4% of updates late |\n| Label online availability | 99.5% | 0.5% | 7.2% offline |\n| SGU uptime | 99.9% | 0.1% | 1.44% unreachable |\n| Cloud API availability | 99.95% | 0.05% | 0.72% errors |\n| OTA success | 99.7% | 0.3% | 4.32% failed |\n| POS ingest within 500 ms | 95% | 5% | 72% late |\n| Price attestation accuracy | 100% | **none** | any failure, ever |\n\nAttestation has no budget and no burn-rate alert. A label never displays a price it cannot verify, so the acceptable number of unverifiable prices reaching a shelf is zero. There is nothing to burn."
+      }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Error budget remaining (30 days)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 8 }
+    },
+    {
+      "id": 11,
+      "type": "gauge",
+      "title": "Price path",
+      "description": "Budget 1%. What is left of it after the last 3 days of measured error ratio, extrapolated across the month.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 4, "x": 0, "y": 9 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "clamp_min(1 - (usslp:sli_price_path:error_ratio3d / 0.01), 0)",
+          "legendFormat": "budget left"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.25 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "showThresholdMarkers": true, "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 12,
+      "type": "gauge",
+      "title": "Cloud API",
+      "description": "Budget 0.05%.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 4, "x": 4, "y": 9 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "clamp_min(1 - (usslp:sli_cloud_api:error_ratio3d / 0.0005), 0)",
+          "legendFormat": "budget left"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.25 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "showThresholdMarkers": true, "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 13,
+      "type": "gauge",
+      "title": "POS ingest",
+      "description": "Budget 5%.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 4, "x": 8, "y": 9 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "clamp_min(1 - (usslp:sli_pos_ingest:error_ratio3d / 0.05), 0)",
+          "legendFormat": "budget left"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.25 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "showThresholdMarkers": true, "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 14,
+      "type": "gauge",
+      "title": "OTA success",
+      "description": "Budget 0.3%.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 4, "x": 12, "y": 9 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "clamp_min(1 - (usslp:sli_ota:error_ratio3d / 0.003), 0)",
+          "legendFormat": "budget left"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.25 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "showThresholdMarkers": true, "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 15,
+      "type": "gauge",
+      "title": "Label availability",
+      "description": "Budget 0.5%. A steady leak here that never spikes is usually a fleet reaching the end of its battery life, not an incident — check the store runway endpoint before treating it as a fault.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 4, "x": 16, "y": 9 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "clamp_min(1 - (usslp:sli_label_online:error_ratio3d / 0.005), 0)",
+          "legendFormat": "budget left"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.25 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "showThresholdMarkers": true, "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 16,
+      "type": "gauge",
+      "title": "SGU uptime",
+      "description": "Budget 0.1%.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 4, "x": 20, "y": 9 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "clamp_min(1 - (usslp:sli_sgu_uptime:error_ratio3d / 0.001), 0)",
+          "legendFormat": "budget left"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.25 },
+              { "color": "green", "value": 0.5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "showThresholdMarkers": true, "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Burn rates against the alerting thresholds",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 16 }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Price path burn rate",
+      "description": "The 14.4 line is the fast-burn page; 6 is the slow-burn page; 3 and 1 are tickets. Both windows of a pair must cross for the alert to fire, which this panel shows directly: watch for the short window crossing while the long one has not yet.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 17 },
+      "targets": [
+        { "refId": "A", "expr": "usslp:sli_price_path:error_ratio5m / 0.01", "legendFormat": "5m" },
+        { "refId": "B", "expr": "usslp:sli_price_path:error_ratio1h / 0.01", "legendFormat": "1h" },
+        { "refId": "C", "expr": "usslp:sli_price_path:error_ratio6h / 0.01", "legendFormat": "6h" },
+        { "refId": "D", "expr": "usslp:sli_price_path:error_ratio1d / 0.01", "legendFormat": "1d" },
+        { "refId": "E", "expr": "usslp:sli_price_path:error_ratio3d / 0.01", "legendFormat": "3d" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "thresholdsStyle": { "mode": "dashed" } },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "orange", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Cloud API burn rate",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 17 },
+      "targets": [
+        { "refId": "A", "expr": "usslp:sli_cloud_api:error_ratio5m / 0.0005", "legendFormat": "5m" },
+        { "refId": "B", "expr": "usslp:sli_cloud_api:error_ratio1h / 0.0005", "legendFormat": "1h" },
+        { "refId": "C", "expr": "usslp:sli_cloud_api:error_ratio6h / 0.0005", "legendFormat": "6h" },
+        { "refId": "D", "expr": "usslp:sli_cloud_api:error_ratio1d / 0.0005", "legendFormat": "1d" },
+        { "refId": "E", "expr": "usslp:sli_cloud_api:error_ratio3d / 0.0005", "legendFormat": "3d" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "thresholdsStyle": { "mode": "dashed" } },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "orange", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "POS ingest burn rate",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 26 },
+      "targets": [
+        { "refId": "A", "expr": "usslp:sli_pos_ingest:error_ratio5m / 0.05", "legendFormat": "5m" },
+        { "refId": "B", "expr": "usslp:sli_pos_ingest:error_ratio1h / 0.05", "legendFormat": "1h" },
+        { "refId": "C", "expr": "usslp:sli_pos_ingest:error_ratio6h / 0.05", "legendFormat": "6h" },
+        { "refId": "D", "expr": "usslp:sli_pos_ingest:error_ratio1d / 0.05", "legendFormat": "1d" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "thresholdsStyle": { "mode": "dashed" } },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "orange", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "OTA and fleet burn rates",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 26 },
+      "targets": [
+        { "refId": "A", "expr": "usslp:sli_ota:error_ratio1h / 0.003", "legendFormat": "OTA 1h" },
+        { "refId": "B", "expr": "usslp:sli_ota:error_ratio6h / 0.003", "legendFormat": "OTA 6h" },
+        { "refId": "C", "expr": "usslp:sli_label_online:error_ratio1h / 0.005", "legendFormat": "labels 1h" },
+        { "refId": "D", "expr": "usslp:sli_label_online:error_ratio6h / 0.005", "legendFormat": "labels 6h" },
+        { "refId": "E", "expr": "usslp:sli_sgu_uptime:error_ratio1h / 0.001", "legendFormat": "SGU 1h" },
+        { "refId": "F", "expr": "usslp:sli_sgu_uptime:error_ratio6h / 0.001", "legendFormat": "SGU 6h" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "thresholdsStyle": { "mode": "dashed" } },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "orange", "value": 6 },
+              { "color": "red", "value": 14.4 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["last", "max"] } }
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Attestation accuracy — the SLO with no budget",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Attestation failures and controller refusals",
+      "description": "This panel should be a flat zero. Any other value means either a price the platform could not sign (in which case affected labels keep their previous price, and the till and the shelf are diverging) or a controller that could not verify one against its key ring — which is either a key-ring sync problem or someone with write access to a store's broker.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 36 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (increase(usslp_attestation_failures_total[1h]))",
+          "legendFormat": "signing failure: {{reason}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (reason) (increase(sec_compliance_alerts_total[1h]))",
+          "legendFormat": "controller refusal: {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 40, "drawStyle": "bars" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum"] } }
+    },
+    {
+      "id": 32,
+      "type": "stat",
+      "title": "Attestation failures (30 days)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 36 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(usslp_attestation_failures_total[30d])) + sum(increase(sec_compliance_alerts_total[30d])) or vector(0)",
+          "legendFormat": "total"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    }
+  ]
+}

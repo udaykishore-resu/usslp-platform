@@ -1,0 +1,427 @@
+# USSLP — continuous integration.
+#
+# ---------------------------------------------------------------------------
+# A note about where this was written
+# ---------------------------------------------------------------------------
+# The Go module cache was NOT available in the environment where this workflow
+# was authored, so nothing here that invokes `go` has been executed. That is
+# fine and it is stated rather than hidden: USSLP has no third-party
+# dependencies at all (see go.mod), so `go build`, `go vet` and `go test` need
+# only the toolchain — but `govulncheck`, `gosec` and the container scanners
+# fetch a database or a binary at run time, and every one of those steps below
+# is written to degrade gracefully rather than fail the build when it cannot.
+#
+# The deployment-layer jobs — YAML, the Helm chart's structure, the metric
+# names against the Go source, the topic catalogue against canon.AllStreams(),
+# the HCL — need no network and WERE run in the authoring environment. They are
+# invoked here through exactly the same `make` targets a developer runs.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel a superseded run on the same branch. A PR pushed three times in a
+# minute should cost one CI run, not three.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.24"
+  # Reproducible builds: -trimpath plus a fixed toolchain.
+  CGO_ENABLED: "0"
+
+jobs:
+  # =========================================================================
+  # Deployment layer
+  #
+  # First, and with no dependencies on anything else, because it is fast and
+  # because a broken chart or a drifted topic catalogue should fail before
+  # twelve minutes of tests do.
+  # =========================================================================
+  deploy-verify:
+    name: Deployment layer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install --disable-pip-version-check pyyaml
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.3
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+          terraform_wrapper: false
+
+      - name: Install promtool
+        # Validates the PromQL in every recording and alerting rule, which the
+        # YAML check alone cannot: a rule whose expression is nonsense is still
+        # valid YAML.
+        run: |
+          set -euo pipefail
+          VERSION=2.53.1
+          curl -fsSL -o /tmp/prom.tar.gz \
+            "https://github.com/prometheus/prometheus/releases/download/v${VERSION}/prometheus-${VERSION}.linux-amd64.tar.gz"
+          tar -xzf /tmp/prom.tar.gz -C /tmp
+          sudo install -m 0755 "/tmp/prometheus-${VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+          promtool --version
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      # Each target is a separate step so that a failure names itself in the
+      # GitHub UI rather than being "make verify-deploy failed".
+      - name: YAML and JSON parse
+        run: make yaml-check
+
+      - name: Helm chart
+        # `helm lint --strict` plus `helm template` against every environment
+        # values file, and then the structural checker as a second opinion.
+        run: make helm-lint
+
+      - name: Prometheus rules in sync with the chart
+        run: make verify-rules
+
+      - name: Metric names exist in the Go tree
+        # The check that matters most in this job. A plausible-looking metric
+        # name in an alert rule produces an expression that evaluates to
+        # nothing, forever, silently — and an alert that can never fire looks
+        # exactly like coverage.
+        run: make verify-metrics
+
+      - name: Topic catalogue matches canon.AllStreams()
+        # A partition count that drifts re-maps every key to a different
+        # partition and destroys the per-key ordering the platform is built on.
+        run: make verify-topics
+
+      - name: Terraform
+        run: make tf-check
+
+      - name: Shell scripts
+        run: make shell-check
+
+  # =========================================================================
+  # Go
+  # =========================================================================
+  go-checks:
+    name: Go ${{ matrix.check }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [fmt, vet, build]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # go build -buildvcs=true stamps the revision into the binary, and
+          # obs.BuildVersion reads it back. A shallow clone with no tags
+          # produces a binary that reports the wrong version.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gofmt
+        if: matrix.check == 'fmt'
+        run: make fmt-check
+
+      - name: go vet
+        if: matrix.check == 'vet'
+        run: make vet
+
+      - name: build
+        if: matrix.check == 'build'
+        run: make build
+
+      - name: List what was built
+        if: matrix.check == 'build'
+        # Prints the binaries and their sizes. A binary that suddenly doubles in
+        # size is worth noticing, and a binary that is missing entirely is a
+        # cmd/ directory somebody added without adding it to the Makefile.
+        run: ls -la bin/
+
+  test:
+    name: go test -race
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Test with the race detector
+        # -race, not plain `go test`. The platform is built on concurrent event
+        # consumers, an in-memory MQTT broker and a shared metrics registry;
+        # a data race in any of them is a wrong price, not a flaky test.
+        run: make cover
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 14
+
+  # =========================================================================
+  # Security
+  # =========================================================================
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Never fails the build on its own. govulncheck downloads its vulnerability
+    # database at run time; a network blip or an upstream outage must not block
+    # a merge, and the result is reported either way. Making it blocking is a
+    # decision to take when the database fetch is mirrored internally.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install govulncheck
+        id: install
+        continue-on-error: true
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        if: steps.install.outcome == 'success'
+        run: govulncheck ./...
+
+      - name: Report unavailability
+        if: steps.install.outcome != 'success'
+        run: |
+          echo "::warning title=govulncheck::Could not install govulncheck; skipping."
+          echo "This is not a pass. It is an absence of a result."
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: go
+          queries: security-extended
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:go
+
+  # =========================================================================
+  # Containers
+  # =========================================================================
+  images:
+    name: Image ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [deploy-verify]
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every command directory with Go source in it. The "Resolve the command
+        # path" step below fails the job if an entry here has none, so this list
+        # cannot silently drift away from the tree.
+        service:
+          - api-gateway
+          - uig
+          - label-service
+          - device-registry
+          - ota-service
+          - pricing-service
+          - promotion-service
+          - analytics-service
+          - sgu
+          - sec
+          - labelsim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Resolve the command path
+        id: cmd
+        run: |
+          set -euo pipefail
+          case "${{ matrix.service }}" in
+            sgu|sec|labelsim) path="./edge/cmd/${{ matrix.service }}" ;;
+            *)                path="./platform/cmd/${{ matrix.service }}" ;;
+          esac
+          echo "path=${path}" >> "$GITHUB_OUTPUT"
+          test -d "${path#./}" || { echo "::error::${path} does not exist"; exit 1; }
+          compgen -G "${path#./}/*.go" >/dev/null || { echo "::error::${path} has no Go source"; exit 1; }
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: runtime
+          # Load into the local daemon rather than pushing: CI builds to scan,
+          # the release workflow builds to publish.
+          load: true
+          push: false
+          tags: usslp/${{ matrix.service }}:${{ github.sha }}
+          build-args: |
+            SERVICE=${{ matrix.service }}
+            CMD_PATH=${{ steps.cmd.outputs.path }}
+            VERSION=${{ github.sha }}
+            REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+
+      - name: Verify the image is what the Dockerfile claims
+        run: |
+          set -euo pipefail
+          img=usslp/${{ matrix.service }}:${{ github.sha }}
+
+          # Non-root, numerically. A cluster enforcing runAsNonRoot without a
+          # numeric UID cannot verify a named user, and the Gatekeeper and
+          # Kyverno policies in deploy/policy both require 65532.
+          user=$(docker image inspect "$img" --format '{{.Config.User}}')
+          if [ "$user" != "65532:65532" ]; then
+            echo "::error::image runs as '$user', expected 65532:65532"; exit 1
+          fi
+
+          # No shell. distroless/static has none, and an image that acquired one
+          # has acquired a base image change nobody reviewed.
+          if docker run --rm --entrypoint /bin/sh "$img" -c 'echo shell present' 2>/dev/null; then
+            echo "::error::the image has a shell"; exit 1
+          fi
+          echo "non-root and shell-free: ok"
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@0.24.0
+        # The scan must not block a merge on a CVE in a base image that has no
+        # fix yet. The SARIF upload below is what makes the finding visible and
+        # tracked; a hard failure here just teaches people to skip CI.
+        continue-on-error: true
+        with:
+          image-ref: usslp/${{ matrix.service }}:${{ github.sha }}
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles(format('trivy-{0}.sarif', matrix.service)) != ''
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+
+      - name: Fail on a CRITICAL with a fix available
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: usslp/${{ matrix.service }}:${{ github.sha }}
+          format: table
+          severity: CRITICAL
+          # A CRITICAL that HAS a fix is a base image we have not rebuilt. That
+          # is actionable, so it blocks. An unfixed one is reported and does not.
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Generate an SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: usslp/${{ matrix.service }}:${{ github.sha }}
+          format: spdx-json
+          output-file: sbom-${{ matrix.service }}.spdx.json
+          artifact-name: sbom-${{ matrix.service }}.spdx.json
+
+      - name: Upload the SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom-${{ matrix.service }}.spdx.json
+          retention-days: 90
+
+  # =========================================================================
+  # Admission policy
+  # =========================================================================
+  policy:
+    name: Admission policies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [deploy-verify]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.15.3
+
+      - name: Install the Kyverno CLI
+        run: |
+          set -euo pipefail
+          VERSION=1.12.5
+          curl -fsSL -o /tmp/kyverno.tar.gz \
+            "https://github.com/kyverno/kyverno/releases/download/v${VERSION}/kyverno-cli_v${VERSION}_linux_x86_64.tar.gz"
+          tar -xzf /tmp/kyverno.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/kyverno /usr/local/bin/kyverno
+          kyverno version
+
+      - name: Render the chart
+        # The rendered manifests are what admission actually sees, so the
+        # policies are tested against those rather than against the templates.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rendered
+          for f in deploy/helm/usslp/values-*.yaml; do
+            name=$(basename "$f" .yaml)
+            helm template usslp deploy/helm/usslp \
+              --namespace usslp \
+              --values deploy/helm/usslp/values.yaml \
+              --values "$f" > "/tmp/rendered/${name}.yaml"
+            echo "rendered ${name}: $(grep -c '^kind:' "/tmp/rendered/${name}.yaml") objects"
+          done
+
+      - name: The chart satisfies its own Kyverno policies
+        # If the platform's own chart cannot pass the platform's own admission
+        # policies, one of the two is wrong — and finding out in CI is very much
+        # cheaper than finding out during a production sync.
+        run: |
+          set -euo pipefail
+          kyverno apply deploy/policy/kyverno/policies.yaml \
+            --resource /tmp/rendered/values-prod-use1.yaml \
+            --policy-report \
+            --detailed-results

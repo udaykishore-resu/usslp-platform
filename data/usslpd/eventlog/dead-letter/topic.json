@@ -1,0 +1,7 @@
+{
+  "name": "dead-letter",
+  "partitions": 4,
+  "retention_hours": 336,
+  "compacted": false,
+  "description": "Poison messages for human triage"
+}

@@ -1,0 +1,564 @@
+# USSLP — SLO alerts, multi-window multi-burn-rate.
+#
+# CANONICAL SOURCE. See recording-rules.yaml for the sync arrangement with the
+# Helm chart.
+#
+# ===========================================================================
+# Why burn rates and not thresholds
+# ===========================================================================
+# The naive version of these alerts is "page when p99 > 3s for 5 minutes". It
+# is wrong in both directions at once.
+#
+# It is too sensitive: a 5-minute window at a platform doing 52,000 price
+# updates a second is a large sample, and a brief regional blip that consumes
+# 0.01% of a month's error budget will still cross a raw threshold. Paging on
+# that trains people to close pages without reading them.
+#
+# It is also not sensitive enough: a service that sits at 98.9% for a week
+# never crosses a "p99 > 3s" threshold at all — every individual 5-minute
+# window looks nearly fine — and yet it has burned the entire month's budget.
+# Nobody is paged and the SLO is missed.
+#
+# The burn rate fixes both. It asks one question: *at the rate we are currently
+# failing, how long until the whole month's error budget is gone?* A burn rate
+# of 1 exactly exhausts the budget in 30 days. A burn rate of 14.4 exhausts 2%
+# of it in an hour.
+#
+#   burn_rate = observed_error_ratio / error_budget
+#
+# The pairs below come from the Google SRE workbook's multi-window scheme:
+#
+#   page   14.4x over 1h,  confirmed by 5m    → 2% of the budget in one hour
+#   page    6x  over 6h,  confirmed by 30m    → 5% of the budget in six hours
+#   ticket  3x  over 1d,  confirmed by 2h     → 10% of the budget in a day
+#   ticket  1x  over 3d,  confirmed by 6h     → the slow leak that misses the
+#                                                month without ever spiking
+#
+# The short window in each pair is what makes the alert *stop*. A 1h-window
+# alert with no short-window conjunct keeps firing for an hour after the
+# incident is resolved, which is how an on-call engineer learns to ignore the
+# resolution notification too.
+#
+# ===========================================================================
+# Error budgets
+# ===========================================================================
+#   price update p99 < 3 s ........... 99%     budget 0.01
+#   label online availability ........ 99.5%   budget 0.005
+#   SGU uptime ....................... 99.9%   budget 0.001
+#   cloud API availability ........... 99.95%  budget 0.0005
+#   OTA success ...................... 99.7%   budget 0.003
+#   POS ingest p95 < 500 ms .......... 95%     budget 0.05
+#   price attestation accuracy ....... 100%    NO BUDGET — see the last group
+#
+# The thresholds below are the burn rate multiplied by the budget, written out
+# rather than computed, so that reading a rule tells you the number it compares
+# against without doing arithmetic in your head at 3 a.m.
+
+groups:
+
+  # =========================================================================
+  # Price path — the 3-second SLO. 99%, budget 0.01.
+  # =========================================================================
+  - name: usslp.slo.price-path
+    rules:
+      - alert: USSLPPricePathErrorBudgetBurnFast
+        # 14.4 * 0.01 = 0.144
+        expr: |
+          usslp:sli_price_path:error_ratio1h > 0.144
+          and
+          usslp:sli_price_path:error_ratio5m > 0.144
+        for: 2m
+        labels:
+          severity: critical
+          slo: price_path
+          burn_rate: "14.4"
+          page: "true"
+        annotations:
+          summary: "Price path is burning its error budget 14.4x (2% of the month in one hour)"
+          description: >-
+            More than 14.4% of price updates are taking longer than 3 seconds to
+            reach the glass, sustained over an hour and confirmed in the last
+            five minutes. At this rate 2% of the 30-day error budget is gone
+            every hour. Every minute of this is a shelf somewhere showing a
+            price the till does not agree with.
+          hop_breakdown: >-
+            Check the per-hop dashboard before anything else. The budget is
+            50ms UIG, 30ms durable append, 120ms Label Service, 150ms MQTT
+            publish, 150ms bridge+LAN, 300ms Zigbee, 2000ms E-Ink, 200ms ACK.
+            usslp:hop_uig_ingest:p99, usslp:hop_label_fanout:p99,
+            usslp:hop_device_publish:p99 and usslp:hop_sec_delivery:p99 localise
+            it in one glance.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/price-path-latency.md"
+
+      - alert: USSLPPricePathErrorBudgetBurnSlow
+        # 6 * 0.01 = 0.06
+        expr: |
+          usslp:sli_price_path:error_ratio6h > 0.06
+          and
+          usslp:sli_price_path:error_ratio30m > 0.06
+        for: 15m
+        labels:
+          severity: critical
+          slo: price_path
+          burn_rate: "6"
+          page: "true"
+        annotations:
+          summary: "Price path is burning its error budget 6x (5% of the month in six hours)"
+          description: >-
+            Sustained degradation rather than a spike. Six hours at this rate
+            costs 5% of the month's budget.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/price-path-latency.md"
+
+      - alert: USSLPPricePathErrorBudgetBurnTicket
+        # 3 * 0.01 = 0.03
+        expr: |
+          usslp:sli_price_path:error_ratio1d > 0.03
+          and
+          usslp:sli_price_path:error_ratio2h > 0.03
+        for: 1h
+        labels:
+          severity: warning
+          slo: price_path
+          burn_rate: "3"
+          page: "false"
+        annotations:
+          summary: "Price path will miss its SLO this month if nothing changes"
+          description: >-
+            A day at 3x burn is 10% of the budget. Not a page — a ticket, with
+            a working day to fix it.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/price-path-latency.md"
+
+      - alert: USSLPPricePathErrorBudgetLeak
+        # 1 * 0.01 = 0.01
+        expr: |
+          usslp:sli_price_path:error_ratio3d > 0.01
+          and
+          usslp:sli_price_path:error_ratio6h > 0.01
+        for: 3h
+        labels:
+          severity: warning
+          slo: price_path
+          burn_rate: "1"
+          page: "false"
+        annotations:
+          summary: "Price path is leaking error budget at exactly the rate that misses the month"
+          description: >-
+            This is the failure mode a threshold alert cannot see: no single
+            window looks bad, and the month is missed anyway.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/price-path-latency.md"
+
+  # =========================================================================
+  # Cloud API availability — 99.95%, budget 0.0005.
+  # =========================================================================
+  - name: usslp.slo.cloud-api
+    rules:
+      - alert: USSLPCloudAPIErrorBudgetBurnFast
+        # 14.4 * 0.0005 = 0.0072
+        expr: |
+          usslp:sli_cloud_api:error_ratio1h > 0.0072
+          and
+          usslp:sli_cloud_api:error_ratio5m > 0.0072
+        for: 2m
+        labels:
+          severity: critical
+          slo: cloud_api
+          burn_rate: "14.4"
+          page: "true"
+        annotations:
+          summary: "Cloud API is burning its error budget 14.4x"
+          description: >-
+            Over 0.72% of inbound requests are failing. usslp_requests_total's
+            outcome label is set by obs.StandardMetrics.ObserveRequest from the
+            handler's own error return, so this is the platform's own verdict on
+            the request, not a status-code approximation.
+            usslp:cloud_api:error_ratio_by_service1h says which service.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/cloud-api-availability.md"
+
+      - alert: USSLPCloudAPIErrorBudgetBurnSlow
+        # 6 * 0.0005 = 0.003
+        expr: |
+          usslp:sli_cloud_api:error_ratio6h > 0.003
+          and
+          usslp:sli_cloud_api:error_ratio30m > 0.003
+        for: 15m
+        labels:
+          severity: critical
+          slo: cloud_api
+          burn_rate: "6"
+          page: "true"
+        annotations:
+          summary: "Cloud API is burning its error budget 6x"
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/cloud-api-availability.md"
+
+      - alert: USSLPCloudAPIErrorBudgetBurnTicket
+        # 3 * 0.0005 = 0.0015
+        expr: |
+          usslp:sli_cloud_api:error_ratio1d > 0.0015
+          and
+          usslp:sli_cloud_api:error_ratio2h > 0.0015
+        for: 1h
+        labels:
+          severity: warning
+          slo: cloud_api
+          burn_rate: "3"
+          page: "false"
+        annotations:
+          summary: "Cloud API will miss its 99.95% SLO this month if nothing changes"
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/cloud-api-availability.md"
+
+      - alert: USSLPCloudAPIErrorBudgetLeak
+        # 1 * 0.0005 = 0.0005
+        expr: |
+          usslp:sli_cloud_api:error_ratio3d > 0.0005
+          and
+          usslp:sli_cloud_api:error_ratio6h > 0.0005
+        for: 3h
+        labels:
+          severity: warning
+          slo: cloud_api
+          burn_rate: "1"
+          page: "false"
+        annotations:
+          summary: "Cloud API is leaking error budget at the rate that misses the month"
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/cloud-api-availability.md"
+
+  # =========================================================================
+  # POS ingest — p95 < 500 ms. 95%, budget 0.05.
+  #
+  # A 5% budget is large, so the fast-burn threshold lands at 72%. That looks
+  # alarming until you notice it is the correct number: with a 5% budget you
+  # genuinely have to be failing most requests to burn 2% of the month in an
+  # hour. The component alert on usslp_uig_latency_budget_exceeded_total fires
+  # far earlier and is what catches a gateway drifting past its own 50 ms slice.
+  # =========================================================================
+  - name: usslp.slo.pos-ingest
+    rules:
+      - alert: USSLPPOSIngestErrorBudgetBurnFast
+        # 14.4 * 0.05 = 0.72
+        expr: |
+          usslp:sli_pos_ingest:error_ratio1h > 0.72
+          and
+          usslp:sli_pos_ingest:error_ratio5m > 0.72
+        for: 2m
+        labels:
+          severity: critical
+          slo: pos_ingest
+          burn_rate: "14.4"
+          page: "true"
+        annotations:
+          summary: "POS ingest is burning its error budget 14.4x"
+          description: >-
+            More than 72% of POS deliveries are taking over 500 ms to become
+            durable. A POS that is kept waiting retries, and a retry storm at a
+            chain's nightly price load is a self-amplifying outage.
+            usslp:pos_ingest_latency:p95_by_adapter says which integration.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/pos-ingest.md"
+
+      - alert: USSLPPOSIngestErrorBudgetBurnSlow
+        # 6 * 0.05 = 0.30
+        expr: |
+          usslp:sli_pos_ingest:error_ratio6h > 0.30
+          and
+          usslp:sli_pos_ingest:error_ratio30m > 0.30
+        for: 15m
+        labels:
+          severity: critical
+          slo: pos_ingest
+          burn_rate: "6"
+          page: "true"
+        annotations:
+          summary: "POS ingest is burning its error budget 6x"
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/pos-ingest.md"
+
+      - alert: USSLPPOSIngestErrorBudgetBurnTicket
+        # 3 * 0.05 = 0.15
+        expr: |
+          usslp:sli_pos_ingest:error_ratio1d > 0.15
+          and
+          usslp:sli_pos_ingest:error_ratio2h > 0.15
+        for: 1h
+        labels:
+          severity: warning
+          slo: pos_ingest
+          burn_rate: "3"
+          page: "false"
+        annotations:
+          summary: "POS ingest will miss its SLO this month if nothing changes"
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/pos-ingest.md"
+
+  # =========================================================================
+  # OTA success — 99.7%, budget 0.003.
+  #
+  # No 5-minute window. A firmware rollout dispatches in waves with quiet-hour
+  # gaps between them, so a five-minute rate is frequently zero and frequently
+  # unrepresentative. The short window of each pair is 30m/2h here instead.
+  # =========================================================================
+  - name: usslp.slo.ota
+    rules:
+      - alert: USSLPOTAErrorBudgetBurnFast
+        # 14.4 * 0.003 = 0.0432
+        expr: |
+          usslp:sli_ota:error_ratio1h > 0.0432
+          and
+          usslp:sli_ota:error_ratio30m > 0.0432
+        for: 10m
+        labels:
+          severity: critical
+          slo: ota_success
+          burn_rate: "14.4"
+          page: "true"
+        annotations:
+          summary: "OTA rollout is failing fast enough to burn 2% of the month's budget per hour"
+          description: >-
+            Over 4.3% of terminal device outcomes are failed, boot_failed,
+            silent or rolled_back. A firmware that bricks labels is not
+            recoverable over the air, so pause the rollout before diagnosing —
+            POST /v1/ota/jobs/{id}/pause.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/ota-rollout.md"
+
+      - alert: USSLPOTAErrorBudgetBurnSlow
+        # 6 * 0.003 = 0.018
+        expr: |
+          usslp:sli_ota:error_ratio6h > 0.018
+          and
+          usslp:sli_ota:error_ratio1h > 0.018
+        for: 30m
+        labels:
+          severity: warning
+          slo: ota_success
+          burn_rate: "6"
+          page: "false"
+        annotations:
+          summary: "OTA rollout is burning its error budget 6x"
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/ota-rollout.md"
+
+      - alert: USSLPOTAErrorBudgetBurnTicket
+        # 3 * 0.003 = 0.009
+        expr: |
+          usslp:sli_ota:error_ratio1d > 0.009
+          and
+          usslp:sli_ota:error_ratio6h > 0.009
+        for: 2h
+        labels:
+          severity: warning
+          slo: ota_success
+          burn_rate: "3"
+          page: "false"
+        annotations:
+          summary: "OTA success rate will miss its 99.7% SLO this month"
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/ota-rollout.md"
+
+  # =========================================================================
+  # Label online availability — 99.5%, budget 0.005.
+  #
+  # The SLI is a gauge ratio averaged over the window rather than a ratio of
+  # events, because "how many labels are online" is a level, not a rate. The
+  # burn-rate arithmetic is identical; only the way the ratio is computed
+  # differs. The shortest window is 30m because the registry's health sweep
+  # needs three missed beacons at 30-second intervals to move a device to
+  # offline, so a 5-minute window would be measuring the sweep's latency rather
+  # than the fleet's health.
+  # =========================================================================
+  - name: usslp.slo.label-availability
+    rules:
+      - alert: USSLPLabelAvailabilityBurnFast
+        # 14.4 * 0.005 = 0.072
+        expr: |
+          usslp:sli_label_online:error_ratio1h > 0.072
+          and
+          usslp:sli_label_online:error_ratio30m > 0.072
+        for: 10m
+        labels:
+          severity: critical
+          slo: label_online
+          burn_rate: "14.4"
+          page: "true"
+        annotations:
+          summary: "More than 7.2% of the label fleet is offline"
+          description: >-
+            registry_devices by lifecycle state. At this scale the cause is
+            almost never the labels: look for a store or region that lost its
+            gateway. usslp:stores_autonomous:count and
+            usslp:sgu_upstream_queue_depth:max separate "the stores are fine and
+            the cloud cannot see them" from "the stores are down".
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/fleet-health.md"
+
+      - alert: USSLPLabelAvailabilityBurnSlow
+        # 6 * 0.005 = 0.03
+        expr: |
+          usslp:sli_label_online:error_ratio6h > 0.03
+          and
+          usslp:sli_label_online:error_ratio1h > 0.03
+        for: 30m
+        labels:
+          severity: warning
+          slo: label_online
+          burn_rate: "6"
+          page: "false"
+        annotations:
+          summary: "Label fleet availability is burning its error budget 6x"
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/fleet-health.md"
+
+      - alert: USSLPLabelAvailabilityLeak
+        # 1 * 0.005 = 0.005
+        expr: |
+          usslp:sli_label_online:error_ratio3d > 0.005
+          and
+          usslp:sli_label_online:error_ratio1d > 0.005
+        for: 6h
+        labels:
+          severity: warning
+          slo: label_online
+          burn_rate: "1"
+          page: "false"
+        annotations:
+          summary: "Label fleet availability is leaking budget — likely battery end-of-life, not an incident"
+          description: >-
+            A steady 0.5% offline that never spikes is what a fleet reaching the
+            end of its battery life looks like. Check the store runway endpoint
+            (GET /v1/stores/{id}/runway) before treating it as a fault.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/fleet-health.md"
+
+  # =========================================================================
+  # SGU uptime — 99.9%, budget 0.001.
+  # =========================================================================
+  - name: usslp.slo.sgu-uptime
+    rules:
+      - alert: USSLPSGUUptimeBurnFast
+        # 14.4 * 0.001 = 0.0144
+        expr: |
+          usslp:sli_sgu_uptime:error_ratio1h > 0.0144
+          and
+          usslp:sli_sgu_uptime:error_ratio30m > 0.0144
+        for: 10m
+        labels:
+          severity: critical
+          slo: sgu_uptime
+          burn_rate: "14.4"
+          page: "true"
+        annotations:
+          summary: "Store Gateway Units are burning their uptime budget 14.4x"
+          description: >-
+            More than 1.44% of gateways are unreachable. A gateway that is down
+            takes its whole store's labels with it, because the controllers only
+            ever talk to a broker inside the building.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/sgu-recovery.md"
+
+      - alert: USSLPSGUUptimeBurnSlow
+        # 6 * 0.001 = 0.006
+        expr: |
+          usslp:sli_sgu_uptime:error_ratio6h > 0.006
+          and
+          usslp:sli_sgu_uptime:error_ratio1h > 0.006
+        for: 30m
+        labels:
+          severity: warning
+          slo: sgu_uptime
+          burn_rate: "6"
+          page: "false"
+        annotations:
+          summary: "Store Gateway Unit uptime is burning its budget 6x"
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/sgu-recovery.md"
+
+      - alert: USSLPSGURestartLoop
+        # A gateway that restarts every four minutes has ~100% scrape
+        # availability and is nonetheless broken, which is precisely the case
+        # the uptime SLI above cannot see. usslp_process_uptime_seconds is a
+        # monotonically increasing gauge reset to near zero on every start, so
+        # resets() counts restarts directly.
+        expr: resets(usslp_process_uptime_seconds{service="sgu"}[1h]) > 3
+        for: 5m
+        labels:
+          severity: critical
+          slo: sgu_uptime
+          page: "true"
+        annotations:
+          summary: "Store Gateway Unit {{ $labels.instance }} has restarted more than 3 times in an hour"
+          description: >-
+            Scrape-based uptime cannot see a crash loop. Check the unit's
+            journal and its durable store: a corrupt write-ahead log that fails
+            recovery is the usual cause, and the recovery procedure is in the
+            runbook.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/sgu-recovery.md"
+
+  # =========================================================================
+  # Price attestation accuracy — 100%. No error budget.
+  #
+  # This one deliberately breaks the pattern, because the pattern does not
+  # apply. A burn-rate alert says "you may fail this much"; the attestation
+  # contract says a label never displays a price it cannot verify, and the
+  # acceptable number of unverifiable prices reaching a shelf is zero. There is
+  # nothing to burn.
+  #
+  # So: any increase, ever, pages. The `for` is short rather than absent
+  # because a single scrape-boundary artefact should not page, but two
+  # consecutive minutes of a non-zero rate should.
+  # =========================================================================
+  - name: usslp.slo.attestation
+    rules:
+      - alert: USSLPAttestationFailure
+        expr: increase(usslp_attestation_failures_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+          slo: attestation_accuracy
+          page: "true"
+          compliance: "true"
+        annotations:
+          summary: "The Label Service could not sign a price ({{ $labels.reason }})"
+          description: >-
+            A price that cannot be signed cannot be displayed. This is a full
+            stop on the price path, not a degradation: every affected label
+            keeps its previous price, and the till and the shelf are now
+            diverging for as long as this lasts. The usual cause is the price
+            authority key material being unreadable or expired — check the
+            projected secret at USSLP_PRICE_AUTHORITY_DIR.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/attestation-failure.md"
+
+      - alert: USSLPControllerComplianceRefusal
+        # The other half of the attestation contract. The controller recomputes
+        # the digest from the update it is holding — never from the transmitted
+        # digest — and refuses anything that does not verify against its key
+        # ring. A refusal here means either a key-ring sync problem or someone
+        # with write access to a store's broker.
+        expr: increase(sec_compliance_alerts_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+          slo: attestation_accuracy
+          page: "true"
+          compliance: "true"
+        annotations:
+          summary: "Shelf Edge Controller {{ $labels.sec }} refused an update for compliance ({{ $labels.reason }})"
+          description: >-
+            The controller could not verify a price against its key ring and
+            dropped the update; the previous price stays on the glass. Two
+            causes are worth separating immediately: a key ring the controller
+            has not synced since a key rotation, which is a fleet problem, and a
+            signature that genuinely does not verify, which is a security
+            incident. A compromised controller or an attacker with write access
+            to the store's broker cannot change a displayed price — they can
+            only prevent one from changing, which is what this alert is.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/attestation-failure.md"
+
+  # =========================================================================
+  # Error budget exhaustion — informational, not paging.
+  #
+  # These do not fire on a burn rate. They report the remaining budget so that
+  # a release decision has a number behind it: a service with 4% of its month
+  # left is not a service that should be taking a risky deploy.
+  # =========================================================================
+  - name: usslp.slo.budget-remaining
+    rules:
+      - alert: USSLPPricePathBudgetNearlyExhausted
+        expr: usslp:sli_price_path:error_ratio3d > 0.008
+        for: 6h
+        labels:
+          severity: info
+          slo: price_path
+          page: "false"
+        annotations:
+          summary: "Price path has consumed most of its error budget over the last three days"
+          description: >-
+            Not an incident. A signal for the release process: freeze
+            non-essential deploys to the price path until the budget recovers.

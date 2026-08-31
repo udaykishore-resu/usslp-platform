@@ -1,0 +1,7 @@
+{
+  "name": "price-updates",
+  "partitions": 4,
+  "retention_hours": 168,
+  "compacted": false,
+  "description": "Accepted price changes, keyed store:sku"
+}

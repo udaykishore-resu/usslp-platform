@@ -1,0 +1,133 @@
+# USSLP — production, eu-west-1 (EU data residency).
+#
+# The difference between this file and us-east-1 is not capacity. It is that
+# personal and transactional data belonging to an EU tenant must not leave the
+# region, and the deployment has to make that structurally true rather than
+# merely intended.
+#
+# Three mechanisms, all here:
+#
+#  1. dataResidency.enforced. The NetworkPolicy and the OPA constraints in
+#     deploy/policy read it; a workload in this namespace has no egress path
+#     to another region's endpoints.
+#  2. A region-local secret store. The credentials for this region live in an
+#     eu-west-1 secret store and are never replicated out of it, so a
+#     misconfigured service in another region cannot authenticate here even if
+#     the network allowed it.
+#  3. audit-log retention. The compliance record is region-local and the
+#     statutory period is longer here; the topic's 365-day retention is set by
+#     canon.StreamAudit and is the same everywhere, but the S3 archive behind
+#     it is region-pinned in deploy/terraform.
+#
+# What is NOT different: the SLOs, the sizing, the alert thresholds. A European
+# retailer gets the same three-second price path as an American one.
+
+global:
+  region: eu-west-1
+  environment: prod
+  imageRegistry: ghcr.io/usslp
+  clusterDomain: cluster.local
+  dataResidency:
+    enforced: true
+    # Tenants whose data may be processed here. The class, not the tenant ID:
+    # the list of EU tenants changes weekly and a values file is the wrong
+    # place for it. Membership is carried on the tenant record and enforced by
+    # the OPA constraint in deploy/policy/gatekeeper.
+    allowedTenantClasses:
+      - eu
+      - eea
+      - uk
+
+image:
+  pullPolicy: IfNotPresent
+  tag: ""
+
+externalSecrets:
+  enabled: true
+  refreshInterval: 1h
+  secretStoreRef:
+    # A region-local store. Not the global one: a credential that can be read
+    # from another region is a credential that has left the region.
+    name: usslp-eu-west-1-store
+    kind: ClusterSecretStore
+  remotePathPrefix: usslp/prod/eu-west-1
+
+istio:
+  enabled: true
+  holdApplicationUntilProxyStarts: true
+
+networkPolicy:
+  enabled: true
+  dnsNamespace: kube-system
+  posSourceCIDRs: []
+
+ingress:
+  enabled: true
+  className: nginx
+  host: api.eu-west-1.usslp.REPLACE-ME.example
+  annotations:
+    cert-manager.io/cluster-issuer: usslp-public-issuer
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+  tls:
+    enabled: true
+    secretName: usslp-prod-euw1-tls
+
+gatewayAPI:
+  enabled: false
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+  prometheusRule:
+    enabled: true
+
+topicProvisioning:
+  enabled: true
+  bootstrapServers: "REPLACE-ME.kafka.eu-west-1.amazonaws.com:9098"
+  replicationFactor: 3
+  minInsyncReplicas: 2
+  iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-euw1-topics"
+
+priorityClasses:
+  create: true
+
+topologySpread:
+  enabled: true
+
+nodeSelector:
+  usslp.io/workload: platform
+
+tolerations:
+  - key: usslp.io/dedicated
+    operator: Equal
+    value: platform
+    effect: NoSchedule
+
+services:
+  label-service:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-euw1-label-service"
+  pos-integration-gw:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-euw1-pos-integration-gw"
+  device-registry:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-euw1-device-registry"
+  ota-service:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-euw1-ota-service"
+  mqtt-broker:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-euw1-mqtt-broker"
+  kafka-connect:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-euw1-kafka-connect"
+  api-gateway:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-euw1-api-gateway"
+  pricing-ai-service:
+    # The workload key is the capacity table's name; the image is
+    # `pricing-service`, which is what platform/cmd/pricing-service builds, and
+    # the metric `service` label is "pricing-service" too. Three names for one
+    # thing, each correct in its own place.
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-euw1-pricing-ai-service"
+  promotion-service:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-euw1-promotion-service"
+
+  analytics-service:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-euw1-analytics-service"

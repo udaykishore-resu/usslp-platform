@@ -1,0 +1,29 @@
+{{- if .Values.priorityClasses.create }}
+{{- range $name, $class := .Values.priorityClasses.classes }}
+---
+# PriorityClasses are cluster-scoped, so they are created once and shared by
+# every release in the cluster. They are in this chart rather than in a
+# bootstrap chart because the values that define them are the same values the
+# Deployments reference, and splitting them makes the two drift.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "usslp.labels" $ | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-20"
+    # Cluster-scoped objects survive a release deletion; ArgoCD would otherwise
+    # prune a PriorityClass another release's pods still reference.
+    argocd.argoproj.io/sync-options: Prune=false
+value: {{ $class.value }}
+# false: nothing gets this priority by accident. A workload that wants to
+# outrank analytics has to say so.
+globalDefault: false
+description: {{ $class.description | quote }}
+# PreemptLowerPriority. Under node pressure the price path takes the node and
+# analytics is evicted — which is the whole reason these classes exist. Setting
+# Never here would make the numbers decorative.
+preemptionPolicy: PreemptLowerPriority
+{{- end }}
+{{- end }}

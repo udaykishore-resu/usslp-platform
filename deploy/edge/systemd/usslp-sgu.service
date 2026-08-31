@@ -1,0 +1,146 @@
+# USSLP Store Gateway Unit.
+#
+# The SGU is an appliance in a back office, not a pod. It has no Kubernetes, no
+# External Secrets Operator and frequently no on-site staff — which is why the
+# binary reads every configuration value from a file as well as an environment
+# variable (NAME_FILE=/run/secrets/x), and why the hardening below is done by
+# systemd rather than by a container runtime.
+#
+# Install:  deploy/edge/install.sh
+# Configure: /etc/usslp/sgu.env  (from deploy/edge/config/sgu.env.template)
+# Recover:  deploy/edge/RUNBOOK.md
+
+[Unit]
+Description=USSLP Store Gateway Unit
+Documentation=https://github.com/usslp/usslp/blob/main/deploy/edge/RUNBOOK.md
+# The store's MQTT broker must come up whether or not the WAN is available.
+# `network.target` rather than `network-online.target`: waiting for online means
+# a store whose broadband is down after a power cut does not start its own
+# broker — which is the exact scenario the offline brain exists for. The store
+# would stay dark until an engineer visited.
+After=network.target local-fs.target
+Wants=network.target
+
+[Service]
+# Type=exec, not Type=notify: the binary does not implement sd_notify, so
+# systemd cannot know when it is *ready* — only when it has execed. Readiness is
+# observed through the binary's own /readyz on the admin port, which is what
+# deploy/edge/install.sh polls after starting the unit.
+#
+# Type=exec rather than Type=simple so that systemd reports a start failure —
+# a bad configuration, a port already bound — instead of reporting success and
+# then a crash three seconds later.
+Type=exec
+
+User=usslp
+Group=usslp
+
+ExecStart=/usr/local/bin/usslp-sgu
+EnvironmentFile=/etc/usslp/sgu.env
+
+# SIGTERM, then wait. The gateway's own drain is USSLP_SHUTDOWN_GRACE (20s by
+# default): it stops bridging, flushes the upstream queue to disk and closes the
+# durable store. TimeoutStopSec must exceed it or systemd SIGKILLs mid-flush and
+# the store loses the tail of its outage record.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=45
+
+# Always restart. A store gateway that stays down takes its whole store's
+# labels with it, because the controllers only ever talk to a broker inside the
+# building. RestartSec is short and the burst limit is generous, because
+# crash-looping while retrying is better than giving up.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+# ---------------------------------------------------------------------------
+# Hardening
+#
+# The threat model is a hostile store network and a physically accessible box.
+# Somebody can plug a laptop into the same switch; the cleaner can reach the
+# cabinet. Everything below narrows what a compromised gateway process can do.
+# ---------------------------------------------------------------------------
+
+# Filesystem. Everything read-only except the two directories the gateway owns.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=usslp
+StateDirectoryMode=0700
+LogsDirectory=usslp
+ReadWritePaths=/var/lib/usslp /var/log/usslp
+# The credentials, mounted read-only. config.Loader reads NAME_FILE before NAME,
+# so these files take precedence over anything in the environment file.
+ReadOnlyPaths=/etc/usslp
+
+# Privilege.
+NoNewPrivileges=true
+# The broker binds 1883 and the diagnostics port 8080, both above 1024, so the
+# service needs no capabilities at all. If a deployment moves the broker to a
+# privileged port, add CAP_NET_BIND_SERVICE here rather than running as root.
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateUsers=true
+
+# Kernel and device surface.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=true
+DevicePolicy=closed
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+# Go's runtime does not need a writable-and-executable mapping; refusing one
+# blocks the most common shellcode injection path.
+MemoryDenyWriteExecute=true
+
+# Network. IPv4, IPv6 and Unix only: no raw sockets, no netlink, no packet
+# sockets. A gateway that cannot open a raw socket cannot be turned into a
+# sniffer for the store's network.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+# Allow the store LAN, loopback, and outbound to the cloud. The store LAN CIDR
+# is a parameter — install.sh writes it from the store's configuration; the
+# default below is the RFC1918 space, which is what a store network is.
+IPAddressAllow=localhost
+IPAddressAllow=10.0.0.0/8
+IPAddressAllow=172.16.0.0/12
+IPAddressAllow=192.168.0.0/16
+# The cloud broker is reached over the public internet. Narrow this to the
+# region's NLB address range once it is known; `any` here is honest about what
+# the default permits rather than pretending otherwise.
+IPAddressAllow=any
+
+# Syscalls. @system-service is the standard allow-list for a long-running
+# daemon; the exclusions remove the families a Go network service never needs.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @cpu-emulation @debug @mount @module @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+
+# Resources. A store gateway is a small box — often 4 GB of RAM — shared with
+# whatever else the retailer put on it.
+MemoryMax=2G
+MemoryHigh=1500M
+CPUQuota=200%
+TasksMax=4096
+LimitNOFILE=65536
+# The broker holds one connection per controller (about 25) plus the labels'
+# sessions; 65536 is generous and cheap.
+
+# Journal.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=usslp-sgu
+
+[Install]
+WantedBy=multi-user.target

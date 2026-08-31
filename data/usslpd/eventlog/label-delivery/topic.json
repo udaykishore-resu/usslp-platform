@@ -1,0 +1,7 @@
+{
+  "name": "label-delivery",
+  "partitions": 4,
+  "retention_hours": 168,
+  "compacted": false,
+  "description": "Delivery confirmations from the edge"
+}

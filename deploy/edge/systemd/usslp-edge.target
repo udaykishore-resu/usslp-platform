@@ -1,0 +1,18 @@
+# USSLP edge tier — one handle for the whole store.
+#
+#   systemctl stop usslp-edge.target     # stop every controller
+#   systemctl start usslp-edge.target
+#
+# The gateway is deliberately NOT part of this target. Stopping every controller
+# for maintenance is a routine act; stopping the gateway takes the store's
+# broker down with it, and the retained price of every label in the building
+# goes with the broker. Those two operations should not share a switch.
+
+[Unit]
+Description=USSLP edge tier (Shelf Edge Controllers)
+Documentation=https://github.com/usslp/usslp/blob/main/deploy/edge/RUNBOOK.md
+After=usslp-sgu.service
+Wants=usslp-sgu.service
+
+[Install]
+WantedBy=multi-user.target

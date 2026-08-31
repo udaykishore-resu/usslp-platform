@@ -1,0 +1,237 @@
+# USSLP — dev cluster.
+#
+# A shared development cluster, not a laptop. For a laptop use
+# deploy/compose/docker-compose.dev.yml, which needs no cluster at all.
+#
+# What is deliberately different from production, and why:
+#   - one replica of everything, and every PDB at 0. A dev cluster is drained
+#     constantly and a PDB that blocks a drain is a dev cluster that cannot be
+#     upgraded. This is the one place minAvailable 0 is right.
+#   - no External Secrets. A dev cluster has no secret store; credentials are
+#     created by hand and the chart is told not to manage them.
+#   - EMQX at one replica, anonymous access. There is no device PKI here.
+#   - device-registry is off: it refuses to start without a certificate
+#     hierarchy, and there is none here.
+#   - analytics-service runs at one replica with the retention windows cut to
+#     days, so a dev cluster does not carry a production data pyramid.
+
+global:
+  region: local
+  environment: dev
+  imageRegistry: ghcr.io/usslp
+
+image:
+  pullPolicy: Always
+  tag: main
+
+externalSecrets:
+  enabled: false
+
+istio:
+  enabled: false
+
+networkPolicy:
+  # Off in dev. A default-deny policy in a cluster people are actively poking
+  # at with kubectl port-forward and curl generates more confusion than
+  # security, and the policies are exercised in staging where they matter.
+  enabled: false
+
+ingress:
+  enabled: true
+  className: nginx
+  host: usslp.dev.internal
+  tls:
+    enabled: false
+    secretName: usslp-tls
+
+gatewayAPI:
+  enabled: false
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+  prometheusRule:
+    # The burn-rate alerts need days of history to mean anything. Loading them
+    # into a dev Prometheus produces alerts that are always firing or never
+    # firing, and either teaches people to ignore them.
+    enabled: false
+
+topicProvisioning:
+  # No Kafka in dev.
+  enabled: false
+
+priorityClasses:
+  # PriorityClasses are cluster-scoped and preemption in a shared dev cluster
+  # means one team's deploy evicts another's.
+  create: false
+
+topologySpread:
+  # A single-AZ dev cluster cannot satisfy a zone constraint, and
+  # ScheduleAnyway would make it a no-op with a warning event on every pod.
+  enabled: false
+
+services:
+  label-service:
+    replicas: {min: 1, max: 3}
+    pdb: {minAvailable: 0}
+    resources:
+      requests: {cpu: 100m, memory: 128Mi}
+      limits: {cpu: "1", memory: 1Gi}
+    hpa:
+      enabled: false
+    secrets: []
+    env:
+      USSLP_LABEL_HTTP_ADDR: "0.0.0.0:8080"
+      USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_DEFAULT_CURRENCY: USD
+      USSLP_SCHEDULER_TICK: 1s
+      # No USSLP_PRICE_AUTHORITY_DIR: the service generates an ephemeral
+      # signing key and warns that attestations signed with it verify against
+      # no key ring in the field. Correct for dev, catastrophic anywhere else.
+      USSLP_MQTT_BROKER_URL: tcp://usslp-mqtt-broker:1883
+
+  pos-integration-gw:
+    replicas: {min: 1, max: 3}
+    pdb: {minAvailable: 0}
+    resources:
+      requests: {cpu: 100m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    hpa:
+      enabled: false
+    secrets: []
+    env:
+      USSLP_UIG_ADDR: "0.0.0.0:8080"
+      USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_UIG_SHUTDOWN_GRACE: 20s
+      USSLP_UIG_OPERATOR_TOKEN: dev-operator-token
+
+  device-registry:
+    # Off by default in dev. platform/cmd/device-registry refuses to start
+    # without a certificate hierarchy at USSLP_REGISTRY_PKI_DIR, and the
+    # repository ships no key-ceremony command to produce one. Enable it once
+    # a hierarchy has been created and loaded into a Secret named
+    # usslp-device-registry-pki.
+    enabled: false
+
+  ota-service:
+    replicas: {min: 1, max: 2}
+    pdb: {minAvailable: 0}
+    resources:
+      requests: {cpu: 100m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    hpa:
+      enabled: false
+    secrets: []
+    env:
+      USSLP_OTA_HTTP_ADDR: "0.0.0.0:8080"
+      USSLP_OTA_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_OTA_DATA_DIR: /var/lib/usslp/ota
+      USSLP_OTA_ARTIFACT_DIR: /var/lib/usslp/firmware
+      USSLP_EVENTLOG_DIR: /var/lib/usslp/eventlog
+      USSLP_MQTT_URL: tcp://usslp-mqtt-broker:1883
+      USSLP_SHUTDOWN_GRACE: 20s
+
+  mqtt-broker:
+    replicas: {min: 1, max: 1}
+    pdb: {minAvailable: 0}
+    resources:
+      requests: {cpu: 200m, memory: 512Mi}
+      limits: {cpu: "1", memory: 2Gi}
+    hpa:
+      enabled: false
+    secrets: []
+    storage:
+      kind: persistentVolumeClaim
+      size: 5Gi
+      storageClassName: standard
+      mountPath: /opt/emqx/data
+    env:
+      EMQX_ALLOW_ANONYMOUS: "true"
+      EMQX_RETAINER__ENABLE: "true"
+      EMQX_MQTT__MAX_QOS_ALLOWED: "2"
+      EMQX_PROMETHEUS__ENABLE: "true"
+      # Single node: no cluster discovery, so no API-server permission needed.
+      EMQX_CLUSTER__DISCOVERY_STRATEGY: manual
+
+  kafka-connect:
+    enabled: false
+
+  api-gateway:
+    replicas: {min: 1, max: 3}
+    pdb: {minAvailable: 0}
+    resources:
+      requests: {cpu: 100m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    hpa:
+      enabled: false
+    secrets: []
+    env:
+      USSLP_GATEWAY_HTTP_ADDR: "0.0.0.0:8080"
+      # The binary's own admin default is :9080; pinned here so the shared
+      # ServiceMonitor and probes find it where they expect it.
+      USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_UIG_ADDR: "http://usslp-pos-integration-gw:8080"
+      USSLP_LABEL_SERVICE_ADDR: "http://usslp-label-service:8080"
+      USSLP_OTA_SERVICE_ADDR: "http://usslp-ota-service:8080"
+      USSLP_PRICING_SERVICE_ADDR: "http://usslp-pricing-ai-service:8080"
+      USSLP_PROMOTION_SERVICE_ADDR: "http://usslp-promotion-service:8080"
+      # device-registry is disabled in dev, so this upstream will fail and the
+      # gateway will open its breaker. That is the honest state and it is
+      # visible in usslp_gateway_breaker_state.
+      USSLP_DEVICE_REGISTRY_ADDR: "http://usslp-device-registry:8080"
+      USSLP_ANALYTICS_SERVICE_ADDR: "http://usslp-analytics-service:8080"
+      USSLP_BOOTSTRAP_TENANT: demo-retail
+
+  pricing-ai-service:
+    replicas: {min: 1, max: 2}
+    pdb: {minAvailable: 0}
+    resources:
+      requests: {cpu: 200m, memory: 512Mi}
+      limits: {cpu: "1", memory: 2Gi}
+    hpa:
+      enabled: false
+    secrets: []
+    env:
+      USSLP_PRICING_HTTP_ADDR: "0.0.0.0:8080"
+      USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_DEFAULT_CURRENCY: USD
+
+  promotion-service:
+    replicas: {min: 1, max: 2}
+    pdb: {minAvailable: 0}
+    resources:
+      requests: {cpu: 100m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    hpa:
+      enabled: false
+    secrets: []
+    env:
+      USSLP_PROMOTION_HTTP_ADDR: "0.0.0.0:8080"
+      USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_PROMOTION_DEFAULT_ZONE: UTC
+      USSLP_PROMOTION_SWEEP_INTERVAL: 10s
+
+  # One replica, and the retention pyramid flattened: a dev cluster wants the
+  # reports to work, not a hot/warm/cold ageing model with a production window.
+  analytics-service:
+    replicas: {min: 1, max: 1}
+    pdb: {minAvailable: 0}
+    resources:
+      requests: {cpu: 200m, memory: 512Mi}
+      limits: {cpu: "1", memory: 2Gi}
+    hpa:
+      enabled: false
+    secrets: []
+    env:
+      USSLP_ANALYTICS_HTTP_ADDR: "0.0.0.0:8080"
+      USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+      USSLP_DATA_DIR: /var/lib/usslp
+      USSLP_ANALYTICS_HOT_DAYS: "1"
+      USSLP_ANALYTICS_WARM_DAYS: "3"
+      USSLP_ANALYTICS_COLD_DAYS: "7"

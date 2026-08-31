@@ -1,0 +1,57 @@
+# USSLP edge self-update.
+#
+# Runs deploy/edge/update.sh, which downloads the pinned version, verifies its
+# checksum, swaps the symlink and restarts the units — reverting automatically
+# if the new binary does not reach /readyz.
+#
+# Paired with usslp-update.timer. The timer's window is what makes this safe on
+# a fleet of 100,000 stores; see the comments there.
+
+[Unit]
+Description=USSLP edge self-update
+Documentation=https://github.com/usslp/usslp/blob/main/deploy/edge/RUNBOOK.md
+# network-online here, unlike the gateway unit: an update genuinely does need
+# the WAN, and a store that cannot reach the internet should skip the update
+# rather than fail in a way that looks like a fault.
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/usslp/update.env
+
+[Service]
+Type=oneshot
+User=root
+# Root, unavoidably: the script writes to /usr/local/lib/usslp and calls
+# systemctl. It is the one thing on the box that needs it, which is why it is a
+# separate unit that runs for thirty seconds a day rather than a privilege the
+# gateway holds permanently.
+
+EnvironmentFile=/etc/usslp/update.env
+ExecStart=/usr/local/lib/usslp/update.sh
+
+# An update that hangs must not hold the box in a half-updated state. The script
+# has its own internal timeouts; this is the backstop.
+TimeoutStartSec=900
+
+# No Restart. A failed update is reported and left alone: retrying an update
+# that failed halfway is how a fleet gets into three different states at once.
+# The script rolls back on its own before exiting non-zero.
+Restart=no
+
+# Hardening. Lighter than the service units — this one legitimately writes to
+# /usr/local and calls systemctl — but still no more than it needs.
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# AF_NETLINK is needed here and nowhere else: systemctl talks to systemd over
+# D-Bus, which needs it.
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=usslp-update

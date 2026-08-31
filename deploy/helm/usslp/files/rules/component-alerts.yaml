@@ -1,0 +1,712 @@
+# USSLP — component alerts.
+#
+# CANONICAL SOURCE. See recording-rules.yaml for the sync arrangement with the
+# Helm chart.
+#
+# These are the alerts that are *not* SLO burn rates: symptoms specific enough
+# that a threshold is the honest instrument, and causes that predict an SLO
+# breach before it happens. Every one of them names a metric that is registered
+# in the Go tree — see the registration index at the top of recording-rules.yaml.
+#
+# The rule for what belongs here rather than in slo-alerts.yaml: an SLO alert
+# says "the retailer is being hurt". A component alert says "something is about
+# to hurt the retailer, or something has broken that the SLO cannot see".
+
+groups:
+
+  # =========================================================================
+  # The price path's own machinery
+  # =========================================================================
+  - name: usslp.component.price-path
+    rules:
+      - alert: USSLPUIGLatencyBudgetExceeded
+        # The gateway owns 50 ms of the 3-second path. It counts its own
+        # breaches, which is far more sensitive than the 500 ms POS-ingest SLO
+        # and is the early warning for it.
+        expr: |
+          sum by (adapter) (rate(usslp_uig_latency_budget_exceeded_total[5m]))
+          /
+          sum by (adapter) (rate(usslp_uig_ingest_total[5m]))
+          > 0.01
+        for: 10m
+        labels:
+          severity: warning
+          component: pos-integration-gw
+        annotations:
+          summary: "UIG adapter {{ $labels.adapter }} is exceeding its 50 ms slice on 1% of deliveries"
+          description: >-
+            Not yet an SLO breach — the retailer-facing budget is 500 ms — but
+            the gateway is eating into the slack the slower hops downstream will
+            need. Usually the durable append, occasionally a slow adapter
+            callback (Clover fetches the object back; Oracle Retail is SOAP).
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/pos-ingest.md"
+
+      - alert: USSLPUIGPublishFailures
+        expr: rate(usslp_uig_publish_failures_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: pos-integration-gw
+        annotations:
+          summary: "UIG cannot durably publish deliveries from adapter {{ $labels.adapter }}"
+          description: >-
+            The gateway acknowledges a POS the instant a change is durable. If
+            the publish is failing, either it is returning errors to the POS —
+            which will retry, amplifying the load — or worse, it is not. This is
+            the top of the price path; nothing downstream can compensate.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/pos-ingest.md"
+
+      - alert: USSLPUIGCircuitBreakerOpen
+        # 0 closed, 1 half-open, 2 open — the gauge's own help text.
+        expr: usslp_uig_circuit_breaker_state == 2
+        for: 5m
+        labels:
+          severity: warning
+          component: pos-integration-gw
+        annotations:
+          summary: "UIG circuit breaker for {{ $labels.dependency }} is open"
+          description: >-
+            The gateway has stopped calling a dependency that was failing.
+            Deliveries needing it are being refused fast rather than slowly,
+            which is correct, but the retailer is not getting price changes
+            through that path.
+
+      - alert: USSLPUIGQuarantineSpike
+        expr: |
+          sum by (adapter, reason) (rate(usslp_uig_quarantined_total[15m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          component: pos-integration-gw
+        annotations:
+          summary: "UIG is quarantining deliveries from {{ $labels.adapter }} ({{ $labels.reason }})"
+          description: >-
+            A quarantined delivery has had its raw body retained for operator
+            replay (GET /v1/deliveries/{tenant}, POST /v1/replay/{tenant}/{id}).
+            A sustained rate means a retailer's integration has changed shape —
+            a new field, a changed code page, a fixed-width file whose columns
+            moved — not that the platform is broken.
+
+      - alert: USSLPPriceGuardrailRejectionSpike
+        # Refused as a suspected data error rather than as a malformed message.
+        # This is the one rejection reason a merchandising team, not an
+        # engineer, needs to see.
+        expr: |
+          sum by (tenant) (rate(usslp_price_guardrail_rejections_total[15m])) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          component: label-service
+          audience: merchandising
+        annotations:
+          summary: "Price guardrails are refusing changes for tenant {{ $labels.tenant }}"
+          description: >-
+            The guardrail refuses a change whose magnitude suggests a data
+            error — a decimal point in the wrong place, a currency mix-up, a
+            feed that sent cents where it meant units. These never reached a
+            shelf, which is the guardrail working. Somebody in merchandising
+            needs to look at the feed.
+
+      - alert: USSLPLabelsPendingDeliveryRising
+        # A rising floor here is the earliest sign of a store falling off the
+        # mesh — earlier than the fleet SLO, because a label with an authorised
+        # but unconfirmed update is still `active` in the registry.
+        expr: |
+          min_over_time(usslp_labels_pending_delivery[30m]) > 100
+          and
+          deriv(usslp_labels_pending_delivery[30m]) > 0
+        for: 30m
+        labels:
+          severity: warning
+          component: label-service
+        annotations:
+          summary: "Store {{ $labels.store }} has a rising floor of undelivered price updates"
+          description: >-
+            Not a spike during a fan-out — a floor that never drains. The
+            updates were authorised and published and no acknowledgement came
+            back. Check the store's gateway and the controller mesh before the
+            fleet SLO notices.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/fleet-health.md"
+
+      - alert: USSLPLabelDeliveryFailureRate
+        expr: usslp:label_delivery:success_ratio5m < 0.98
+        for: 15m
+        labels:
+          severity: warning
+          component: label-service
+        annotations:
+          summary: "Under 98% of price updates are being acknowledged by the edge"
+          description: >-
+            `duplicate` acknowledgements are excluded from both sides of this
+            ratio: a duplicated frame is at-least-once delivery working, not a
+            failure. This is genuine non-delivery.
+
+  # =========================================================================
+  # The front door
+  # =========================================================================
+  - name: usslp.component.api-gateway
+    rules:
+      - alert: USSLPGatewayUpstreamBreakerOpen
+        # usslp_gateway_breaker_state is a one-hot gauge set: one series per
+        # state carrying 0 or 1 (platform/internal/apigw/metrics.go). So the
+        # test is on the "open" series being 1, not on a numeric encoding.
+        expr: usslp_gateway_breaker_state{state="open"} == 1
+        for: 2m
+        labels:
+          severity: critical
+          component: api-gateway
+          page: "true"
+        annotations:
+          summary: "The API gateway has opened its circuit breaker for {{ $labels.upstream }}"
+          description: >-
+            The gateway has stopped calling an upstream that was failing.
+            Requests needing it are being refused fast rather than slowly, which
+            is correct — but that upstream is unavailable to every retailer.
+            Every upstream the gateway names is a service the chart deploys, so
+            there is no breaker here that is expected to sit open.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/cloud-api-availability.md"
+
+      - alert: USSLPGatewayUpstreamFailures
+        expr: |
+          sum by (upstream, reason) (rate(usslp_gateway_upstream_failures_total[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          component: api-gateway
+        annotations:
+          summary: "The gateway is failing calls to {{ $labels.upstream }} ({{ $labels.reason }})"
+
+      - alert: USSLPGatewayPanics
+        # A recovered panic is a bug that reached production. The gateway keeps
+        # serving, which is why this is not a page — and is exactly why it must
+        # not be allowed to become normal.
+        expr: increase(usslp_gateway_panics_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: api-gateway
+        annotations:
+          summary: "The API gateway recovered a panic in {{ $labels.operation }}"
+
+      - alert: USSLPGatewayRateLimiting
+        expr: |
+          sum by (bucket) (rate(usslp_gateway_rate_limited_total[5m]))
+          /
+          sum(rate(usslp_gateway_requests_total[5m]))
+          > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          component: api-gateway
+        annotations:
+          summary: "More than 5% of requests are being refused by the {{ $labels.bucket }} rate limiter"
+          description: >-
+            Either a retailer has changed their integration's call pattern, or
+            the limit is too tight for legitimate traffic. Both need a human;
+            neither is an outage.
+
+      - alert: USSLPGatewayAuthFailureSpike
+        expr: |
+          sum by (kind) (rate(usslp_gateway_auth_total{outcome!="ok"}[5m]))
+          /
+          sum by (kind) (rate(usslp_gateway_auth_total[5m]))
+          > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          component: api-gateway
+          security: "true"
+        annotations:
+          summary: "Over 20% of {{ $labels.kind }} authentication attempts are failing"
+          description: >-
+            A rotated credential a retailer has not picked up, or credential
+            stuffing. The two look identical from here; the source addresses in
+            the gateway's access log separate them.
+
+      - alert: USSLPGatewayStreamEvictions
+        expr: sum by (reason) (rate(usslp_gateway_stream_evictions_total[15m])) > 0.5
+        for: 15m
+        labels:
+          severity: warning
+          component: api-gateway
+        annotations:
+          summary: "The gateway is closing WebSocket connections ({{ $labels.reason }})"
+          description: >-
+            A slow consumer whose queue overflowed, or a client that stopped
+            answering pings. Either way a retailer's live view of their fleet is
+            being dropped.
+
+  # =========================================================================
+  # Pricing and promotions
+  # =========================================================================
+  - name: usslp.component.pricing
+    rules:
+      - alert: USSLPPricingTierBudgetExceeded
+        # The tier budgets are 10 ms for Tier 1 and 15 ms for Tier 2, which is
+        # why usslp_pricing_tier_seconds' buckets straddle exactly those values.
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, tier) (rate(usslp_pricing_tier_seconds_bucket[5m]))
+          ) > 0.015
+        for: 10m
+        labels:
+          severity: warning
+          component: pricing-ai-service
+        annotations:
+          summary: "Pricing tier {{ $labels.tier }} p99 is over its 15 ms budget"
+          description: >-
+            The pricing tier sits inside the Label Service's 120 ms slice of the
+            price path. A tier that has slipped from 10 ms to 50 ms has not
+            broken the 3-second SLO on its own, and has spent slack the slower
+            hops downstream will need.
+
+      - alert: USSLPPricingModelLoadFailures
+        expr: increase(usslp_pricing_model_loads_total{result!="ok"}[1h]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: pricing-ai-service
+        annotations:
+          summary: "A pricing champion model failed to load ({{ $labels.result }})"
+          description: >-
+            The service falls back to its previous model rather than failing
+            open, so prices are still being produced — by an older model than
+            the one somebody intended to promote.
+
+      - alert: USSLPPricingAnomalySpike
+        expr: sum by (feature) (rate(usslp_pricing_anomalies_total[15m])) > 1
+        for: 15m
+        labels:
+          severity: warning
+          component: pricing-ai-service
+          audience: merchandising
+        annotations:
+          summary: "Pricing is flagging anomalies driven by {{ $labels.feature }}"
+          description: >-
+            A sustained rate means the feature's distribution has shifted, not
+            that individual observations are odd. Usually a data feed changed
+            shape rather than the world changing.
+
+  - name: usslp.component.promotion
+    rules:
+      - alert: USSLPPromotionConflicts
+        # usslp_promotion_conflicts is a gauge of authoring conflicts, labelled
+        # by SEVERITY (platform/internal/promotion/service.go). It is not an
+        # error counter: a low-severity conflict is a normal state of a
+        # merchandising calendar being edited, so the alert is on the severity
+        # label rather than on the gauge being non-zero.
+        expr: sum by (severity) (usslp_promotion_conflicts{severity!="info"}) > 0
+        for: 30m
+        labels:
+          severity: warning
+          component: promotion-service
+          audience: merchandising
+        annotations:
+          summary: "{{ $value }} promotion authoring conflict(s) at severity {{ $labels.severity }}"
+          description: >-
+            Two promotions claim the same labels with no deterministic tiebreak.
+            Which one should win is not a question engineering can answer;
+            merchandising has to.
+
+      - alert: USSLPPromotionTransitionStall
+        # usslp_promotion_transitions_total is labelled `to` — the DESTINATION
+        # state — not `state` and not `outcome`. The values are the
+        # domain.State constants: scheduled, active, cancelled, expired.
+        #
+        # There is no failure label to alert on, so the honest signal is the
+        # absence of activations while promotions are being scheduled: a sweep
+        # that has stopped running looks exactly like a calendar with nothing in
+        # it, and the difference is whether anything is scheduled.
+        expr: |
+          sum(rate(usslp_promotion_transitions_total{to="active"}[1h])) == 0
+          and
+          sum(rate(usslp_promotion_transitions_total{to="scheduled"}[6h])) > 0
+        for: 1h
+        labels:
+          severity: warning
+          component: promotion-service
+        annotations:
+          summary: "Promotions are being scheduled but none are activating"
+          description: >-
+            The activation sweep (USSLP_PROMOTION_SWEEP_INTERVAL) appears to
+            have stopped. Scheduled promotions will silently never reach a
+            shelf, which nobody notices until a customer does.
+
+      - alert: USSLPPromotionFanoutStopped
+        # usslp_promotion_fanout_total is labelled by EVENT TYPE, not outcome.
+        # A publish failure is not distinguishable here, so the alert is on
+        # fan-out having stopped while promotions are active.
+        expr: |
+          sum(rate(usslp_promotion_fanout_total[30m])) == 0
+          and
+          sum(usslp_promotion_active) > 0
+        for: 30m
+        labels:
+          severity: warning
+          component: promotion-service
+        annotations:
+          summary: "Promotions are active but nothing is being published"
+          description: >-
+            A zone broadcast that never happens leaves those controllers' labels
+            on the pre-promotion price while the offer is live everywhere else —
+            which a customer will find before an engineer does.
+
+  # =========================================================================
+  # Event stream
+  # =========================================================================
+  - name: usslp.component.event-stream
+    rules:
+      - alert: USSLPConsumerLagHigh
+        # Aggregated off the per-partition series by a recording rule;
+        # price-updates alone has 1,024 partitions.
+        expr: usslp:consumer_lag:by_topic_group > 100000
+        for: 10m
+        labels:
+          severity: warning
+          component: event-stream
+        annotations:
+          summary: "Consumer group {{ $labels.group }} is 100k records behind on {{ $labels.topic }}"
+          description: >-
+            Distinguish "we are slow" from "we are behind" with
+            usslp:hop_event_handler:p99 on the same topic: flat handler latency
+            with rising lag is a throughput shortfall the autoscaler should be
+            fixing; rising handler latency is a code or dependency problem the
+            autoscaler will make worse.
+
+      - alert: USSLPConsumerLagCritical
+        expr: usslp:consumer_lag:by_topic_group > 1000000
+        for: 10m
+        labels:
+          severity: critical
+          component: event-stream
+          page: "true"
+        annotations:
+          summary: "Consumer group {{ $labels.group }} is a million records behind on {{ $labels.topic }}"
+
+      - alert: USSLPDeadLetterQueueGrowing
+        # Every consumer is required to be idempotent and every poison message
+        # ends up here. A non-zero rate means a deployment introduced one.
+        expr: sum by (topic, group, reason) (rate(usslp_events_dead_lettered_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: event-stream
+        annotations:
+          summary: "Messages are being dead-lettered from {{ $labels.topic }}/{{ $labels.group }} ({{ $labels.reason }})"
+          description: >-
+            The dead-letter stream is for human triage. A sustained rate
+            immediately after a deploy is a poison message the new code cannot
+            handle; roll back rather than triage, then triage.
+
+      - alert: USSLPEventRetryStorm
+        expr: |
+          sum by (topic, group) (rate(usslp_event_retries_total[5m]))
+          /
+          sum by (topic, group) (rate(usslp_events_consumed_total[5m]))
+          > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          component: event-stream
+        annotations:
+          summary: "More than 10% of events on {{ $labels.topic }} are being retried"
+
+      - alert: USSLPEventLogDeadLetterWriteFailure
+        # The embedded log's own counter for records it could not even write to
+        # the dead-letter stream. Those records are gone.
+        expr: rate(eventlog_dead_letter_failures_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: event-stream
+          page: "true"
+        annotations:
+          summary: "The event log is dropping records it cannot dead-letter"
+          description: >-
+            This is data loss, not degradation. The record could not be handled
+            and could not be written to dead-letter, so it was discarded.
+
+  # =========================================================================
+  # MQTT
+  # =========================================================================
+  - name: usslp.component.mqtt
+    rules:
+      - alert: USSLPMQTTClientDisconnected
+        # 1 while the link is up, 0 while it is down — the gauge's own help.
+        expr: usslp_mqtt_client_connected == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: mqtt
+          page: "true"
+        annotations:
+          summary: "{{ $labels.service }} on {{ $labels.instance }} has lost its MQTT link"
+          description: >-
+            The Label Service publishes every price update over this link. It is
+            registered as a *readiness* check, never liveness (contract section
+            7), so the pod is out of the load balancer and is not being
+            restarted — which is correct, and also means nothing will recover it
+            except the broker coming back.
+
+      - alert: USSLPMQTTAckTimeouts
+        # A publish abandoned after the acknowledgement timeout is a price
+        # update the platform believes it sent and the edge never saw.
+        expr: rate(usslp_mqtt_client_ack_timeouts_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: mqtt
+        annotations:
+          summary: "{{ $labels.service }} is abandoning MQTT publishes after the ack timeout"
+
+      - alert: USSLPMQTTBrokerDroppingMessages
+        expr: sum by (reason) (rate(usslp_mqtt_broker_dropped_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: mqtt
+        annotations:
+          summary: "The broker is discarding messages rather than delivering them ({{ $labels.reason }})"
+
+      - alert: USSLPMQTTBrokerInflightBacklog
+        expr: usslp_mqtt_broker_inflight_messages > 50000
+        for: 10m
+        labels:
+          severity: warning
+          component: mqtt
+        annotations:
+          summary: "QoS 1/2 messages are piling up unacknowledged at the broker"
+          description: >-
+            Subscribers are not keeping up. During a store-wide promotion a
+            transient spike is expected; sustained means a controller or a
+            gateway has stopped acknowledging.
+
+  # =========================================================================
+  # Store Gateway Units and the edge
+  # =========================================================================
+  - name: usslp.component.edge
+    rules:
+      - alert: USSLPStoreAutonomous
+        # sgu_store_mode is 1 when the store has lost the cloud and is pricing
+        # from its own rules. This is the system working exactly as designed —
+        # zero label downtime during a WAN outage — so it is a warning, not a
+        # page. What it means operationally is that the cloud's record of this
+        # store now has a gap it will backfill on recovery.
+        expr: sgu_store_mode == 1
+        for: 15m
+        labels:
+          severity: warning
+          component: sgu
+        annotations:
+          summary: "Store {{ $labels.store }} has been running autonomously for 15 minutes"
+          description: >-
+            The store's labels are still being priced correctly from its local
+            rules; the bridge to the cloud is down. Nothing is broken on the
+            shelf. Check the store's WAN before treating this as a platform
+            fault.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/sgu-recovery.md"
+
+      - alert: USSLPStoresAutonomousMany
+        # One store autonomous is a broadband fault. Fifty is the cloud.
+        expr: usslp:stores_autonomous:count > 50
+        for: 5m
+        labels:
+          severity: critical
+          component: sgu
+          page: "true"
+        annotations:
+          summary: "{{ $value }} stores have simultaneously gone autonomous"
+          description: >-
+            A single store going autonomous is that store's broadband. Fifty at
+            once is the cloud side: the broker, its load balancer, or the
+            region.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/sgu-recovery.md"
+
+      - alert: USSLPSGUUpstreamQueueNearFull
+        # Full is not unready — the store is still pricing correctly — but it is
+        # the one queue state that loses data, which is why the gateway's own
+        # readiness check says so in those words.
+        expr: |
+          sgu_upstream_queue{measure="depth"} > 45000
+        for: 10m
+        labels:
+          severity: critical
+          component: sgu
+          page: "true"
+        annotations:
+          summary: "Store {{ $labels.store }}'s upstream buffer is nearly full"
+          description: >-
+            The default cap is 50,000 entries. When it fills, the cloud's record
+            of this outage will have gaps that no replay can recover.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/sgu-recovery.md"
+
+      - alert: USSLPSGUBridgeFailures
+        expr: |
+          sum by (store, direction) (rate(sgu_bridged_total{outcome!="ok"}[10m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          component: sgu
+        annotations:
+          summary: "Store {{ $labels.store }} is failing to bridge {{ $labels.direction }} messages"
+
+      - alert: USSLPMergeConflictsHigh
+        expr: sum by (store) (rate(sgu_merge_conflicts_total[1h])) > 0.05
+        for: 1h
+        labels:
+          severity: warning
+          component: sgu
+        annotations:
+          summary: "Store {{ $labels.store }} is resolving an unusual number of reconciliation conflicts"
+          description: >-
+            Conflicts are expected after an outage: the store priced locally
+            while the cloud priced centrally, and reconciliation picks a winner.
+            A steady rate outside an outage window means the store's local rules
+            and the central prices genuinely disagree.
+
+      - alert: USSLPMeshDeliveryFailures
+        expr: |
+          sum by (sec) (rate(sec_mesh_deliveries_total{outcome!="delivered"}[15m]))
+          /
+          sum by (sec) (rate(sec_mesh_deliveries_total[15m]))
+          > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          component: sec
+        annotations:
+          summary: "Controller {{ $labels.sec }} is failing more than 5% of mesh deliveries"
+          description: >-
+            Check sec_mesh_link_failure_risk for the same controller: predictive
+            healing should already be routing around a degrading link, and a
+            high failure rate with low predicted risk means the model is
+            missing something the radio is seeing.
+
+  # =========================================================================
+  # Device fleet
+  # =========================================================================
+  - name: usslp.component.fleet
+    rules:
+      - alert: USSLPDevicesQuarantinedSpike
+        expr: increase(registry_devices{state="quarantined"}[1h]) > 100
+        for: 15m
+        labels:
+          severity: warning
+          component: device-registry
+        annotations:
+          summary: "More than 100 devices were quarantined in the last hour"
+          description: >-
+            Quarantine is a deliberate act — a device failing authentication, or
+            one an operator pulled. A hundred in an hour is a fleet-wide event,
+            usually a certificate expiry the key ceremony did not renew.
+
+      - alert: USSLPProvisioningRejectionRate
+        expr: |
+          sum by (reason) (rate(registry_provision_rejected_total[15m]))
+          /
+          sum(rate(registry_provisioned_total[15m]) + rate(registry_provision_rejected_total[15m]))
+          > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          component: device-registry
+        annotations:
+          summary: "More than 5% of provisioning requests are being refused ({{ $labels.reason }})"
+
+      - alert: USSLPOTARollbackTriggered
+        # An automatic rollback is the system protecting the fleet. It is still
+        # something a human must know about immediately: it means a firmware
+        # reached real devices and failed on them.
+        expr: increase(ota_rollbacks_total[15m]) > 0
+        labels:
+          severity: critical
+          component: ota-service
+          page: "true"
+        annotations:
+          summary: "An OTA rollout triggered an automatic rollback"
+          description: >-
+            The rollout's failure threshold was crossed and the controller
+            reverted. Do not restart the rollout before understanding why — a
+            firmware that bricks a label is not recoverable over the air.
+          runbook_url: "https://github.com/usslp/usslp/blob/main/deploy/runbooks/ota-rollout.md"
+
+      - alert: USSLPOTAArtifactsRejected
+        expr: increase(ota_artifacts_rejected_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: ota-service
+        annotations:
+          summary: "Firmware upload refused ({{ $labels.reason }})"
+          description: >-
+            If the reason is a signature or key problem, check that
+            USSLP_OTA_SIGNING_KEYS is populated: with no keys configured the
+            service starts normally and refuses every upload, logging it once at
+            boot and nowhere else.
+
+  # =========================================================================
+  # Process health
+  #
+  # Deliberately thin. Liveness is "the process is scheduling goroutines" and
+  # readiness carries the dependency checks, so most of what a generic
+  # "service down" alert would catch is already handled by removing the pod
+  # from the endpoint list. What is left is the things Kubernetes cannot see.
+  # =========================================================================
+  - name: usslp.component.process
+    rules:
+      - alert: USSLPTargetDown
+        expr: up{job=~"usslp.*"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: process
+        annotations:
+          summary: "{{ $labels.service }} on {{ $labels.instance }} is not scrapeable"
+          description: >-
+            The admin port carries /metrics, /healthz and /readyz on a listener
+            separate from business traffic precisely so that a service shedding
+            customer load stays scrapeable. A target that is down is therefore a
+            stronger signal than a failing readiness probe.
+
+      - alert: USSLPGoroutineLeak
+        expr: |
+          usslp_go_goroutines > 50000
+          and
+          deriv(usslp_go_goroutines[1h]) > 0
+        for: 1h
+        labels:
+          severity: warning
+          component: process
+        annotations:
+          summary: "{{ $labels.service }} on {{ $labels.instance }} has a growing goroutine count"
+          description: >-
+            Fifty thousand and still climbing after an hour. The usual cause is
+            a context that is never cancelled on a subscription path.
+
+      - alert: USSLPGCPauseHigh
+        expr: usslp_go_gc_pause_p99_seconds > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          component: process
+        annotations:
+          summary: "{{ $labels.service }} is seeing 100ms+ GC pauses"
+          description: >-
+            On the price path a 100 ms pause is two thirds of the MQTT publish
+            budget. Check heap growth on the same service.
+
+      - alert: USSLPKVStoreSnapshotStale
+        # The embedded store's checkpoint age predicts recovery time: a service
+        # restarting with a two-hour-old checkpoint replays two hours of WAL
+        # before it is ready, and readiness gates traffic.
+        expr: |
+          {__name__=~".*_kvstore_snapshot_age_seconds|.*_kv_snapshot_age_seconds"} > 7200
+        for: 30m
+        labels:
+          severity: warning
+          component: process
+        annotations:
+          summary: "{{ $labels.service }}'s embedded store has not checkpointed in two hours"
+          description: >-
+            Recovery time on the next restart is proportional to the write-ahead
+            log accumulated since the last checkpoint.

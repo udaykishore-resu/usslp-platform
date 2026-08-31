@@ -1,0 +1,131 @@
+# USSLP — production, us-east-1 (primary).
+#
+# This file carries the specification's capacity table unchanged: the base
+# values.yaml already encodes it, so almost everything here is region wiring
+# rather than sizing. That is deliberate — a production values file that
+# re-states the sizing is a production values file that will drift from it.
+#
+# us-east-1 is the primary region. It carries the global control plane
+# concerns: it is where a tenant with no residency requirement lands, and it is
+# the region a cross-region failover promotes away from.
+
+global:
+  region: us-east-1
+  environment: prod
+  imageRegistry: ghcr.io/usslp
+  clusterDomain: cluster.local
+  dataResidency:
+    # No restriction. us-east-1 is the default home for tenants with no
+    # residency requirement; the EU and India files are where this matters.
+    enforced: false
+    allowedTenantClasses: []
+
+image:
+  pullPolicy: IfNotPresent
+  # Set by the release workflow to the signed, immutable tag. Never :latest —
+  # both Gatekeeper and Kyverno reject it at admission.
+  tag: ""
+
+externalSecrets:
+  enabled: true
+  refreshInterval: 1h
+  secretStoreRef:
+    name: usslp-cluster-store
+    kind: ClusterSecretStore
+  remotePathPrefix: usslp/prod/us-east-1
+
+istio:
+  enabled: true
+  holdApplicationUntilProxyStarts: true
+
+networkPolicy:
+  enabled: true
+  dnsNamespace: kube-system
+  # Empty. A retailer's POS reaches the gateway through the ingress path like
+  # everything else; an entry here is a hole punched for a specific integration
+  # that could not, and it needs a name and a review attached to it.
+  posSourceCIDRs: []
+
+ingress:
+  enabled: true
+  className: nginx
+  host: api.us-east-1.usslp.REPLACE-ME.example
+  annotations:
+    cert-manager.io/cluster-issuer: usslp-public-issuer
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+  tls:
+    enabled: true
+    secretName: usslp-prod-use1-tls
+
+gatewayAPI:
+  # Not yet in production. Staging proves it first.
+  enabled: false
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    scrapeTimeout: 10s
+  prometheusRule:
+    enabled: true
+
+topicProvisioning:
+  enabled: true
+  # From the Terraform output msk_bootstrap_brokers_sasl_iam. A placeholder
+  # here; the ArgoCD ApplicationSet substitutes the real value from the
+  # cluster's config, and `usslp.validate` fails the render if it is empty.
+  bootstrapServers: "REPLACE-ME.kafka.us-east-1.amazonaws.com:9098"
+  replicationFactor: 3
+  minInsyncReplicas: 2
+  # IRSA role with kafka-cluster:Connect/CreateTopic/DescribeTopic on the MSK
+  # cluster. From deploy/terraform/modules/iam-irsa.
+  iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-use1-topics"
+
+priorityClasses:
+  create: true
+
+topologySpread:
+  enabled: true
+
+# Three AZs. The zone spread constraint is what turns that into resilience
+# rather than three copies of the same failure domain.
+nodeSelector:
+  usslp.io/workload: platform
+
+tolerations:
+  - key: usslp.io/dedicated
+    operator: Equal
+    value: platform
+    effect: NoSchedule
+
+services:
+  # Sizing comes from values.yaml. Only the per-service IAM roles are here,
+  # because they are the one thing that is genuinely per-region.
+  label-service:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-use1-label-service"
+  pos-integration-gw:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-use1-pos-integration-gw"
+  device-registry:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-use1-device-registry"
+  ota-service:
+    # The only service that reads the firmware bucket. One role per service,
+    # never one shared role: that distinction is the whole point.
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-use1-ota-service"
+  mqtt-broker:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-use1-mqtt-broker"
+  kafka-connect:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-use1-kafka-connect"
+  api-gateway:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-use1-api-gateway"
+  pricing-ai-service:
+    # The workload key is the capacity table's name; the image is
+    # `pricing-service`, which is what platform/cmd/pricing-service builds, and
+    # the metric `service` label is "pricing-service" too. Three names for one
+    # thing, each correct in its own place.
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-use1-pricing-ai-service"
+  promotion-service:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-use1-promotion-service"
+
+  analytics-service:
+    iamRoleArn: "arn:aws:iam::REPLACE-ME:role/usslp-prod-use1-analytics-service"

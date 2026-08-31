@@ -1,0 +1,7 @@
+{
+  "name": "label-state",
+  "partitions": 4,
+  "retention_hours": 0,
+  "compacted": true,
+  "description": "Compacted latest state per label"
+}

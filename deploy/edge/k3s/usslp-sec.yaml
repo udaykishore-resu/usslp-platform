@@ -1,0 +1,214 @@
+# USSLP Shelf Edge Controllers on K3s.
+#
+# A DaemonSet, not a Deployment, and not a StatefulSet.
+#
+# The reasoning: in a K3s store deployment each controller node is a physical
+# box bolted to a shelf section, and the mapping between a controller process
+# and its hardware is one-to-one and fixed. That is a DaemonSet's exact shape —
+# one pod per node, scheduled by where the hardware is rather than by where
+# there is capacity. A Deployment would schedule two controllers on one node and
+# none on another, which for a component that drives a specific 8 m of aisle is
+# meaningless.
+#
+# The controller ID comes from the node name, injected through the downward API.
+# That is what makes this one manifest rather than 25: the identity is a
+# property of the hardware, and the hardware knows its own name.
+#
+# Where the controllers are *simulated* — which is what edge/cmd/sec in this
+# repository does — this DaemonSet runs one per node of whatever the cluster
+# has, which is a useful test topology and not a store.
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: usslp-sec
+  namespace: usslp-edge
+automountServiceAccountToken: false
+# A controller talks to exactly one thing: the store's broker, inside the
+# building. It has no reason to hold a credential for the API server.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: usslp-sec-config
+  namespace: usslp-edge
+data:
+  USSLP_ENVIRONMENT: "prod"
+  USSLP_LOG_LEVEL: "info"
+  USSLP_LOG_FORMAT: "json"
+  USSLP_ENABLE_PPROF: "false"
+  USSLP_TRACE_SAMPLE_ONE_IN: "1000"
+
+  USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+  USSLP_DATA_DIR: "/var/lib/usslp"
+
+  # The zone this controller owns: ~8 m of shelf, ~240 labels.
+  USSLP_ZONE_LABELS: "240"
+  USSLP_ZONE_LENGTH_M: "24"
+  USSLP_MESH_HEALING: "predictive"
+  USSLP_MESH_SAMPLE_INTERVAL: "30s"
+
+  # Telemetry is batched per controller, not per label. 40,000 labels reporting
+  # every five minutes is 133 messages/second per store and 13 million/second
+  # across 100,000 stores; batched per controller it is 0.08/second per store.
+  # Shortening this is a fleet-wide decision.
+  USSLP_TELEMETRY_INTERVAL: "5m"
+  USSLP_HEARTBEAT_INTERVAL: "10s"
+  USSLP_ACTIVE_WINDOW: "5m"
+  USSLP_SHUTDOWN_GRACE: "15s"
+  USSLP_SIM_SPEED: "1"
+
+  USSLP_STORE_ID: "REPLACE-ME"
+  USSLP_TENANT_ID: "REPLACE-ME"
+  USSLP_REGION: "us-east-1"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: usslp-sec
+  namespace: usslp-edge
+  labels:
+    app.kubernetes.io/name: usslp-sec
+    app.kubernetes.io/component: sec
+    app.kubernetes.io/part-of: usslp
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: usslp-sec
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One at a time. Twenty-five controllers restarting together takes every
+      # shelf in the store off the mesh at once, and the labels — which hold
+      # their last price and refuse anything with a lower sequence number —
+      # would be showing correct prices with nothing able to change them.
+      maxUnavailable: 1
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: usslp-sec
+        app.kubernetes.io/component: sec
+        app.kubernetes.io/part-of: usslp
+    spec:
+      serviceAccountName: usslp-sec
+      automountServiceAccountToken: false
+      nodeSelector:
+        # Only nodes that are actually shelf controllers. Without this the
+        # DaemonSet would also schedule a controller onto the gateway box.
+        usslp.io/role: shelf-controller
+      tolerations:
+        - key: usslp.io/role
+          operator: Equal
+          value: shelf-controller
+          effect: NoSchedule
+      terminationGracePeriodSeconds: 30
+      # Longer than USSLP_SHUTDOWN_GRACE (15s).
+      priorityClassName: system-node-critical
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sec
+          image: ghcr.io/usslp/sec:REPLACE-ME
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: admin
+              containerPort: 9090
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: usslp-sec-config
+          env:
+            # The controller's identity is its hardware's identity. One
+            # DaemonSet, 25 controllers, no per-instance manifests.
+            - name: USSLP_SEC_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # The gateway runs with hostNetwork, so it is reachable at the
+            # gateway node's own address. This is the ClusterIP Service, which
+            # works because the controllers here *are* in the cluster — unlike
+            # the systemd deployment, where they are not.
+            - name: USSLP_GATEWAY_BROKER_URL
+              value: tcp://usslp-sgu.usslp-edge.svc.cluster.local:1883
+            # The key ring the controller verifies attestations against. It
+            # recomputes the digest from the update it is holding — never from
+            # the transmitted digest — and refuses anything that does not
+            # verify, leaving the previous price on the glass and raising a
+            # compliance alert. A stale key ring after a rotation therefore
+            # freezes every price in this zone, silently as far as the shelf is
+            # concerned.
+            - name: USSLP_KEYRING_FILE
+              value: /run/secrets/usslp/keyring.json
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            # The controller's registered checks are the gateway link and the
+            # zone mesh. Readiness only — a gateway restart must not restart 25
+            # controllers.
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 5
+            failureThreshold: 24
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/usslp
+            - name: secrets
+              mountPath: /run/secrets/usslp
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: state
+          # An emptyDir, unlike the gateway's PVC. A controller's state is its
+          # zone's mesh routing table and per-label sequence numbers, both of
+          # which it rebuilds from the retained messages on the store's broker
+          # when it reconnects — which is exactly why price updates are
+          # retained: a controller rebooting after a power cut recovers the
+          # current price of every label in its zone from the local broker,
+          # without a round trip to a cloud that may be unreachable.
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: secrets
+          secret:
+            secretName: usslp-sec-secrets
+            defaultMode: 0400
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Mi

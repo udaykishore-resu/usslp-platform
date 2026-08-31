@@ -1,0 +1,200 @@
+# USSLP label firmware configuration.
+#
+# The options here are the ones a deployment actually has to choose between, not
+# a knob for every constant. Anything that is a property of the hardware lives
+# in the devicetree; anything that is a property of the platform's contracts is
+# not configurable at all.
+
+menu "USSLP smart shelf label"
+
+config USSLP_DISPLAY_TIER
+	int "Display tier fitted to this board"
+	default 0
+	range 0 2
+	help
+	  0 = 2.9in 296x128 BWR, 1 = 4.2in 400x300 BW, 2 = 5.85in 600x448 ACeP.
+	  The numbering is labelsim.DisplayTier's, so a tier in a planogram, in the
+	  simulator and in this firmware are the same integer.
+
+	  This is baked into the image and checked against the OTA manifest: an
+	  image built for one panel must never be swapped onto another, because the
+	  waveform tables are different and the wrong waveform can leave a panel
+	  permanently marked.
+
+config USSLP_EINK_PLANES
+	int "Ink planes the panel controller is loaded with"
+	default 2
+	range 0 2
+	help
+	  Two for the BWR panel (a black plane and a red plane, one bit each), one
+	  for the plain black and white panel, zero for the seven-colour panel,
+	  which is streamed rather than buffered.
+
+config USSLP_EINK_PLANE_BYTES
+	int "Bytes in one packed ink plane"
+	default 4736
+	help
+	  width*height/8, rounded up. Set per tier in boards/tier_*.conf. The
+	  framebuffer is the largest RAM allocation in the firmware, which is why it
+	  is packed here and one byte per pixel on the controller.
+
+config USSLP_EINK_STREAMING
+	bool "Stream the image to the panel controller instead of buffering it"
+	default n
+	help
+	  The 5.85-inch seven-colour panel is 134 KB at four bits per pixel, which
+	  does not fit alongside the radio stacks in 256 KB. In streaming mode the
+	  decoder writes bands straight into the panel controller's own RAM as they
+	  arrive from the mesh. The cost is that there is no retained local copy to
+	  diff against, which is one of the two reasons that panel cannot do a
+	  partial refresh.
+
+menuconfig USSLP_ZIGBEE
+	bool "Zigbee 3.0 primary radio"
+	default y
+	help
+	  The primary uplink: an IEEE 802.15.4 mesh through the TI CC2652P
+	  co-processor to the Shelf Edge Controller. Requires the ZBOSS stack from
+	  the nRF Connect SDK.
+
+if USSLP_ZIGBEE
+
+config USSLP_ZIGBEE_ENDPOINT
+	int "USSLP application endpoint"
+	default 10
+
+config USSLP_ZIGBEE_ROUTER
+	bool "Build as a mains-powered relay rather than a sleepy end device"
+	default n
+	help
+	  A relay keeps its receiver on and routes for its children. It is the same
+	  firmware with a different power policy and a larger neighbour table, and
+	  it is what makes a 25-metre aisle reachable from one controller.
+
+endif # USSLP_ZIGBEE
+
+config USSLP_BLE
+	bool "BLE 5.0 secondary radio"
+	default y
+	help
+	  Commissioning, field diagnostics and the shopper-facing beacon. The BLE
+	  controller and the 802.15.4 radio share one antenna, so this costs
+	  arbitration time on the primary radio; a store that commissions with NFC
+	  only can turn it off and get the airtime back.
+
+config USSLP_REQUIRE_ATTESTATION
+	bool "Refuse any price update that does not carry an end-to-end attestation"
+	default y
+	help
+	  INTERFACE-CONTRACTS section 5 places attestation verification at the Shelf
+	  Edge Controller, and the Tier 2 to Tier 1 air protocol
+	  (edge/labelsim/wire.go) accordingly carries no signature: what crosses the
+	  mesh is a sequence number, a price and compressed pixels.
+
+	  That design is sound against the threat model it states — an attacker with
+	  write access to the store's broker cannot author a price — but it trusts
+	  the controller, and a controller that has been replaced or rooted is inside
+	  that trust boundary. With this option the label verifies for itself, using
+	  the extended frame type 4 in radio/usslp_wire.h and a key ring it syncs
+	  directly.
+
+	  Set it to n for interoperability with controllers that still speak only
+	  frame types 1-3. Doing so is a deliberate decision to trust Tier 2, and it
+	  is logged at boot so that a fleet audit can find every label running that
+	  way.
+
+config USSLP_ATTESTATION_STRICT_CLOCK
+	bool "Refuse an attestation when the label has no trusted time"
+	default n
+	depends on USSLP_REQUIRE_ATTESTATION
+	help
+	  A label with no clock cannot check a key's validity window. The default is
+	  to verify the signature and skip the window, because the signature is the
+	  real control and a label that refuses every price until it has synced time
+	  is a label that shows nothing after a battery change. Enable this where a
+	  trusted time source is guaranteed and a retired key must never be honoured.
+
+config USSLP_KEYRING_SYNC_INTERVAL_HOURS
+	int "How often to re-sync the price authority key ring"
+	default 24
+	range 1 168
+	help
+	  pki.PriceAuthority rotates with an overlap window. A label that syncs less
+	  often than the overlap will meet a key it does not have and refuse prices
+	  until it catches up.
+
+config USSLP_BEACON_FAST_MS
+	int "Listen interval while active"
+	default 250
+	help
+	  The interval that makes a price change reach the glass inside the
+	  platform's 300 ms budget. It is affordable only inside an activity window;
+	  held all day it costs 208 uA and the cell lasts 99 days. See
+	  power/usslp_budget.h for the arithmetic.
+
+config USSLP_BEACON_SLOW_MS
+	int "Listen interval at rest"
+	default 30000
+	help
+	  The resting interval. A label here is on average half an interval from
+	  being reachable at all, which is why a price load is planned as a window
+	  rather than fired one label at a time.
+
+config USSLP_ACTIVE_WINDOW_MS
+	int "How long to stay on the fast interval after activity"
+	default 60000
+
+config USSLP_TARGET_LIFE_MILLIYEARS
+	int "Battery life the adaptive policy aims at, in thousandths of a year"
+	default 8000
+	help
+	  The power state machine derives its resting interval from this and the
+	  measured workload, rather than from a hard-coded number. A label in a
+	  freezer case, or one being repriced hourly, will choose a slower resting
+	  interval than one on an ambient shelf.
+
+config USSLP_TELEMETRY_INTERVAL_S
+	int "Uplink health report interval"
+	default 300
+	help
+	  Five minutes. Polling 40,000 labels would cost a zone's whole channel;
+	  letting each label speak once every five minutes costs under one per cent
+	  of it.
+
+config USSLP_NFC
+	bool "ST25DV dynamic NFC tag"
+	default y
+
+config USSLP_TAMPER
+	bool "LIS2DH12 tamper detection"
+	default y
+
+config USSLP_OTA
+	bool "Over-the-air update over the mesh"
+	default y
+
+if USSLP_OTA
+
+config USSLP_OTA_DELTA
+	bool "Accept binary delta patches as well as whole images"
+	default y
+
+config USSLP_OTA_CONFIRM_TIMEOUT_S
+	int "Seconds a new image has to confirm itself before the watchdog reverts it"
+	default 600
+	help
+	  A new image marks itself confirmed only after it has joined the mesh and
+	  applied one update. Until then the watchdog is armed and a reset reverts to
+	  the previous slot. Ten minutes is long enough to cover a slow mesh rejoin
+	  and short enough that a label bricked by a bad image is back on the air
+	  within a shift.
+
+endif # USSLP_OTA
+
+module = USSLP
+module-str = usslp
+source "subsys/logging/Kconfig.template.log_config"
+
+endmenu
+
+source "Kconfig.zephyr"

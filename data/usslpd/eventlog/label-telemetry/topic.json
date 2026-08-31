@@ -1,0 +1,7 @@
+{
+  "name": "label-telemetry",
+  "partitions": 4,
+  "retention_hours": 72,
+  "compacted": false,
+  "description": "Battery, RSSI, LQI, temperature heartbeats"
+}

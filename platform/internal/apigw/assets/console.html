@@ -1,0 +1,974 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>USSLP Store Operations</title>
+<style>
+  /* Everything inline. This page is opened when the shelves are wrong, and a
+     store's network at that moment is frequently the reason — a console that
+     needs a CDN is a console that does not render during its own incident. */
+  :root {
+    color-scheme: dark light;
+    --bg:#0b0f14; --panel:#121821; --panel2:#0f151d; --line:#1f2833;
+    --ink:#dce6f2; --dim:#8ea0b5; --faint:#5c6b7e;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --info:#58a6ff; --idle:#3d4956;
+    --grid-ok:#153021; --grid-warn:#33280c; --grid-bad:#3a1517; --grid-idle:#161d26;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:#f2f5f8; --panel:#ffffff; --panel2:#f7f9fb; --line:#d7dee6;
+      --ink:#0f1720; --dim:#4c5a6b; --faint:#7c8b9c;
+      --grid-ok:#d8f3e0; --grid-warn:#faeecd; --grid-bad:#fbdcda; --grid-idle:#e8edf2;
+    }
+  }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:13px/1.45 var(--sans); -webkit-font-smoothing:antialiased; }
+  button, input, select { font:inherit; color:inherit; }
+  button {
+    background:var(--panel2); border:1px solid var(--line); color:var(--ink);
+    border-radius:5px; padding:5px 11px; cursor:pointer;
+  }
+  button:hover { border-color:var(--info); }
+  button.primary { background:var(--info); border-color:var(--info); color:#08111b; font-weight:600; }
+  input, select {
+    background:var(--panel2); border:1px solid var(--line); border-radius:5px;
+    padding:5px 8px; font-family:var(--mono); font-size:12px;
+  }
+  input:focus, select:focus, button:focus { outline:2px solid var(--info); outline-offset:1px; }
+
+  /* ---- chrome ---- */
+  #topbar {
+    display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+    padding:8px 14px; border-bottom:1px solid var(--line); background:var(--panel);
+  }
+  #topbar .brand { font-weight:700; letter-spacing:.4px; font-size:13px; }
+  #topbar .brand span { color:var(--info); }
+  .grow { flex:1 1 auto; }
+  .pill {
+    font:11px/1 var(--mono); padding:5px 9px; border-radius:999px;
+    border:1px solid var(--line); background:var(--panel2); color:var(--dim);
+    display:inline-flex; align-items:center; gap:6px; white-space:nowrap;
+  }
+  .dot { width:7px; height:7px; border-radius:50%; background:var(--idle); }
+  .dot.live { background:var(--ok); box-shadow:0 0 0 3px rgba(63,185,80,.18); }
+  .dot.warn { background:var(--warn); }
+  .dot.down { background:var(--bad); }
+  label.inline { font-size:11px; color:var(--faint); text-transform:uppercase; letter-spacing:.1em; }
+
+  /* ---- layout ---- */
+  main {
+    display:grid; gap:10px; padding:10px;
+    grid-template-columns: 300px minmax(0,1fr) 340px;
+    align-items:start;
+  }
+  @media (max-width:1400px) { main { grid-template-columns: 280px minmax(0,1fr); } .col-right { grid-column:1 / -1; } }
+  @media (max-width:900px)  { main { grid-template-columns: 1fr; } .col-right, .col-left { grid-column:auto; } }
+  .col { display:flex; flex-direction:column; gap:10px; min-width:0; }
+
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; min-width:0; }
+  .card > h2 {
+    margin:0; padding:8px 12px; font-size:10.5px; font-weight:700;
+    text-transform:uppercase; letter-spacing:.14em; color:var(--faint);
+    border-bottom:1px solid var(--line); display:flex; align-items:center; gap:8px;
+  }
+  .card > h2 .note { margin-left:auto; font-weight:500; letter-spacing:0; text-transform:none; font-size:11px; }
+  .card .pad { padding:10px 12px; }
+
+  /* ---- stat tiles ---- */
+  .stats { display:grid; grid-template-columns:repeat(2,1fr); gap:1px; background:var(--line); }
+  .stat { background:var(--panel); padding:9px 12px; }
+  .stat .k { font-size:10px; text-transform:uppercase; letter-spacing:.11em; color:var(--faint); }
+  .stat .v { font:20px/1.2 var(--mono); font-weight:600; margin-top:2px; }
+  .stat .v small { font-size:11px; color:var(--dim); font-weight:400; }
+  .v.ok { color:var(--ok); } .v.warn { color:var(--warn); } .v.bad { color:var(--bad); }
+
+  /* ---- bars ---- */
+  .bar { height:6px; border-radius:3px; background:var(--panel2); overflow:hidden; border:1px solid var(--line); }
+  .bar > i { display:block; height:100%; background:var(--ok); }
+  .bar > i.warn { background:var(--warn); } .bar > i.bad { background:var(--bad); }
+
+  /* ---- label grid ---- */
+  #label-grid-inner {
+    display:grid; grid-template-columns:repeat(auto-fill, minmax(112px, 1fr));
+    gap:4px; padding:10px 12px; max-height:430px; overflow:auto;
+  }
+  .lbl {
+    border:1px solid var(--line); border-radius:5px; padding:5px 6px; background:var(--grid-idle);
+    font-family:var(--mono); font-size:11px; line-height:1.3; min-width:0; position:relative;
+  }
+  .lbl .id { color:var(--faint); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .lbl .sku { color:var(--dim); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .lbl .price { font-size:14px; font-weight:700; letter-spacing:-.2px; }
+  .lbl.state-ok { background:var(--grid-ok); }
+  .lbl.state-pending { background:var(--grid-warn); }
+  .lbl.state-bad { background:var(--grid-bad); }
+  .lbl.flash { animation:flash .9s ease-out; }
+  @keyframes flash {
+    0%   { box-shadow:inset 0 0 0 2px var(--info); transform:scale(1.04); }
+    100% { box-shadow:inset 0 0 0 0 transparent; transform:scale(1); }
+  }
+  .lbl .att { position:absolute; top:4px; right:5px; font-size:9px; }
+  .att.signed { color:var(--ok); } .att.unsigned { color:var(--bad); }
+
+  /* ---- feeds ---- */
+  .feed { max-height:300px; overflow:auto; }
+  .row {
+    display:grid; grid-template-columns:52px 1fr auto; gap:8px;
+    padding:5px 12px; border-bottom:1px solid var(--line); font-size:12px; align-items:baseline;
+  }
+  .row:last-child { border-bottom:none; }
+  .row .t { font:10.5px var(--mono); color:var(--faint); }
+  .row .m { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .row .m b { font-family:var(--mono); font-weight:600; }
+  .row .r { font:11px var(--mono); color:var(--dim); }
+  .tag { font:9.5px var(--mono); padding:1px 5px; border-radius:3px; border:1px solid var(--line); color:var(--dim); }
+  .tag.ok { color:var(--ok); border-color:currentColor; }
+  .tag.warn { color:var(--warn); border-color:currentColor; }
+  .tag.bad { color:var(--bad); border-color:currentColor; }
+
+  table.list { width:100%; border-collapse:collapse; }
+  table.list th, table.list td { padding:5px 12px; text-align:left; border-bottom:1px solid var(--line); font-size:12px; }
+  table.list th { font-size:10px; text-transform:uppercase; letter-spacing:.11em; color:var(--faint); font-weight:600; }
+  table.list td.num { font-family:var(--mono); text-align:right; }
+
+  #latency-chart { display:block; width:100%; height:190px; }
+  .legend { display:flex; gap:14px; padding:0 12px 10px; font:10.5px var(--mono); color:var(--faint); flex-wrap:wrap; }
+  .legend i { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:5px; vertical-align:-1px; }
+
+  form.inline-form { display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:10px 12px; }
+  form.inline-form .full { grid-column:1 / -1; }
+  form.inline-form input { width:100%; }
+  .hint { color:var(--faint); font-size:11px; }
+  .empty { color:var(--faint); padding:14px 12px; font-size:12px; }
+  #toast {
+    position:fixed; right:14px; bottom:14px; max-width:420px; z-index:20;
+    display:flex; flex-direction:column; gap:6px;
+  }
+  #toast div {
+    background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--info);
+    border-radius:6px; padding:8px 11px; font-size:12px; box-shadow:0 6px 22px rgba(0,0,0,.35);
+  }
+  #toast div.bad { border-left-color:var(--bad); }
+  #toast div.ok { border-left-color:var(--ok); }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <div class="brand">USSLP <span>Store Operations</span></div>
+
+  <label class="inline" for="store-select">store</label>
+  <select id="store-select" title="Stores this credential is scoped to"></select>
+  <input id="store-add" size="12" placeholder="add store id" title="Watch another store in this tenant">
+
+  <span class="grow"></span>
+
+  <span class="pill" id="identity" title="The authenticated principal">not authenticated</span>
+  <span class="pill" id="stream-status"><span class="dot" id="stream-dot"></span><span id="stream-text">offline</span></span>
+  <input id="credential" type="password" size="26" placeholder="usslp_live_… or a JWT"
+         title="Held in this browser only; sent as a bearer token and as the WebSocket subprotocol">
+  <button id="connect" class="primary">connect</button>
+</div>
+
+<main>
+  <!-- ------------------------------------------------------------------ -->
+  <div class="col col-left">
+    <section class="card" id="health-panel">
+      <h2>store health <span class="note" id="health-age">—</span></h2>
+      <div class="stats">
+        <div class="stat"><div class="k">labels online</div><div class="v ok" id="h-online">—</div></div>
+        <div class="stat"><div class="k">offline</div><div class="v" id="h-offline">—</div></div>
+        <div class="stat"><div class="k">pending update</div><div class="v" id="h-pending">—</div></div>
+        <div class="stat"><div class="k">battery warnings</div><div class="v" id="h-battery">—</div></div>
+      </div>
+      <div class="pad">
+        <div class="k" style="font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:.11em">mesh health</div>
+        <div class="bar" style="margin:6px 0 4px"><i id="h-mesh-bar" style="width:0%"></i></div>
+        <div class="hint" id="h-mesh-text">no mesh report yet</div>
+      </div>
+    </section>
+
+    <section class="card" id="budget-panel">
+      <h2>slo &amp; error budget <span class="note">3.000 s end to end</span></h2>
+      <div class="stats">
+        <div class="stat"><div class="k">p50</div><div class="v" id="b-p50">—</div></div>
+        <div class="stat"><div class="k">p99</div><div class="v" id="b-p99">—</div></div>
+        <div class="stat"><div class="k">deliveries seen</div><div class="v" id="b-count">0</div></div>
+        <div class="stat"><div class="k">over slo</div><div class="v" id="b-breaches">0</div></div>
+      </div>
+      <div class="pad" id="error-budget">
+        <div class="k" style="font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:.11em">
+          budget burn <span id="b-window">(rolling 200 deliveries, 99% objective)</span>
+        </div>
+        <div class="bar" style="margin:6px 0 4px"><i id="b-burn-bar" style="width:0%"></i></div>
+        <div class="hint" id="b-burn-text">no deliveries observed yet</div>
+      </div>
+    </section>
+
+    <section class="card" id="test-price-panel">
+      <h2>push a test price</h2>
+      <form class="inline-form" id="test-price-form">
+        <input id="tp-sku" placeholder="sku" required autocomplete="off">
+        <input id="tp-amount" placeholder="minor units, e.g. 299" inputmode="numeric" required autocomplete="off">
+        <input id="tp-currency" placeholder="GBP" value="GBP" maxlength="3" autocomplete="off">
+        <input id="tp-reason" placeholder="reason (audited)" value="console test" autocomplete="off">
+        <button class="primary full" type="submit" id="tp-submit">POST /v1/prices</button>
+        <div class="hint full">
+          Writes a real, attested price change to the selected store and watches it land on the shelf
+          through the live stream. The audit record names this credential.
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <!-- ------------------------------------------------------------------ -->
+  <div class="col">
+    <section class="card" id="latency-panel">
+      <h2>end-to-end latency <span class="note">recorded_at → pixels settled</span></h2>
+      <canvas id="latency-chart" width="900" height="190"></canvas>
+      <div class="legend">
+        <span><i style="background:var(--ok)"></i>inside SLO</span>
+        <span><i style="background:var(--bad)"></i>over 3 s</span>
+        <span><i style="background:var(--warn)"></i>3 s objective</span>
+        <span><i style="background:var(--info)"></i>rolling p99</span>
+      </div>
+    </section>
+
+    <section class="card" id="label-grid">
+      <h2>live label grid <span class="note" id="grid-note">waiting for events</span></h2>
+      <div id="label-grid-inner"></div>
+      <div class="empty" id="grid-empty">
+        No labels yet. Connect with a credential and the grid fills as price updates,
+        delivery confirmations and device state changes arrive on /v1/stream.
+      </div>
+    </section>
+  </div>
+
+  <!-- ------------------------------------------------------------------ -->
+  <div class="col col-right">
+    <section class="card" id="price-feed">
+      <h2>recent price changes <span class="note">with attestation</span></h2>
+      <div class="feed" id="price-feed-rows"></div>
+      <div class="empty" id="price-feed-empty">Nothing yet.</div>
+    </section>
+
+    <section class="card" id="ota-panel">
+      <h2>firmware rollouts</h2>
+      <div id="ota-rows"></div>
+      <div class="empty" id="ota-empty">No rollouts in flight.</div>
+    </section>
+
+    <section class="card" id="pos-panel">
+      <h2>pos integrations</h2>
+      <div id="pos-rows"></div>
+      <div class="empty" id="pos-empty">No integrations reported.</div>
+    </section>
+
+    <section class="card" id="event-log">
+      <h2>event log <span class="note" id="event-rate">0 /s</span></h2>
+      <div class="feed" id="event-rows"></div>
+    </section>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  // -----------------------------------------------------------------------
+  // Constants
+  // -----------------------------------------------------------------------
+  var SLO_MS = 3000;                 // the platform's end-to-end budget
+  var SLO_OBJECTIVE = 0.99;          // 99% of deliveries inside it
+  var LATENCY_WINDOW = 200;          // rolling window for the chart and burn
+  var GRID_MAX = 240;                // labels rendered; beyond this the oldest drop
+  var FEED_MAX = 60;
+  var POLL_MS = 15000;
+  var STORAGE = { cred: "usslp.console.credential", stores: "usslp.console.stores", store: "usslp.console.store" };
+
+  var $ = function (id) { return document.getElementById(id); };
+  var store = function (k, v) {
+    try {
+      if (v === undefined) return window.localStorage.getItem(k);
+      if (v === null) { window.localStorage.removeItem(k); return null; }
+      window.localStorage.setItem(k, v);
+      return v;
+    } catch (e) { return null; }   // private browsing, blocked storage
+  };
+
+  var state = {
+    credential: store(STORAGE.cred) || "",
+    storeId: store(STORAGE.store) || "",
+    stores: [],
+    me: null,
+    socket: null,
+    reconnectDelay: 500,
+    labels: new Map(),      // labelId -> {sku, price, currency, state, seq, attested, at}
+    latencies: [],          // {ms, at, labelId}
+    events: 0,
+    eventWindow: [],
+    manualClose: false
+  };
+
+  // -----------------------------------------------------------------------
+  // Small helpers
+  // -----------------------------------------------------------------------
+  function toast(message, kind) {
+    var box = document.createElement("div");
+    if (kind) box.className = kind;
+    box.textContent = message;
+    $("toast").appendChild(box);
+    window.setTimeout(function () { box.remove(); }, 6000);
+  }
+  function clock(iso) {
+    var d = iso ? new Date(iso) : new Date();
+    if (isNaN(d.getTime())) d = new Date();
+    return d.toTimeString().slice(0, 8);
+  }
+  function money(m) {
+    if (!m || typeof m.amount !== "number") return "—";
+    var symbols = { GBP: "£", EUR: "€", USD: "$", JPY: "¥" };
+    var exp = m.currency === "JPY" ? 0 : 2;
+    var sign = m.amount < 0 ? "-" : "";
+    var abs = Math.abs(m.amount);
+    var whole = exp === 0 ? String(abs) : String(Math.floor(abs / 100));
+    var frac = exp === 0 ? "" : "." + String(abs % 100).padStart(2, "0");
+    return sign + (symbols[m.currency] || (m.currency + " ")) + whole + frac;
+  }
+  function percentile(sorted, q) {
+    if (!sorted.length) return 0;
+    var i = Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1));
+    return sorted[i];
+  }
+
+  // -----------------------------------------------------------------------
+  // HTTP
+  // -----------------------------------------------------------------------
+  function api(path, options) {
+    options = options || {};
+    var headers = { accept: "application/json" };
+    if (state.credential) headers.authorization = "Bearer " + state.credential;
+    if (options.body) headers["content-type"] = "application/json";
+    return fetch(path, {
+      method: options.method || "GET",
+      headers: headers,
+      body: options.body ? JSON.stringify(options.body) : undefined
+    }).then(function (res) {
+      return res.text().then(function (text) {
+        var parsed = null;
+        try { parsed = text ? JSON.parse(text) : null; } catch (e) { parsed = null; }
+        if (!res.ok) {
+          var err = new Error((parsed && parsed.message) || (res.status + " " + res.statusText));
+          err.status = res.status;
+          err.code = parsed && parsed.code;
+          err.requestId = res.headers.get("X-Request-Id");
+          throw err;
+        }
+        return parsed;
+      });
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // Identity and store selection
+  // -----------------------------------------------------------------------
+  function loadIdentity() {
+    return api("/v1/me").then(function (me) {
+      state.me = me;
+      $("identity").textContent = me.tenant_id + " · " + me.auth_method + " · " + (me.roles || []).join(", ");
+      var known = [];
+      if (me.stores && me.stores.length) {
+        known = me.stores.slice();
+      } else {
+        var saved = store(STORAGE.stores);
+        known = saved ? saved.split(",").filter(Boolean) : [];
+      }
+      state.stores = known;
+      renderStores();
+    });
+  }
+
+  function renderStores() {
+    var sel = $("store-select");
+    sel.innerHTML = "";
+    if (!state.stores.length) {
+      var opt = document.createElement("option");
+      opt.value = ""; opt.textContent = "— add a store id —";
+      sel.appendChild(opt);
+    }
+    state.stores.forEach(function (id) {
+      var opt = document.createElement("option");
+      opt.value = id; opt.textContent = id;
+      sel.appendChild(opt);
+    });
+    if (state.storeId && state.stores.indexOf(state.storeId) < 0) state.storeId = "";
+    if (!state.storeId && state.stores.length) state.storeId = state.stores[0];
+    sel.value = state.storeId;
+  }
+
+  $("store-add").addEventListener("change", function (e) {
+    var id = e.target.value.trim();
+    if (!id) return;
+    if (state.stores.indexOf(id) < 0) state.stores.push(id);
+    if (!state.me || !state.me.stores || !state.me.stores.length) {
+      store(STORAGE.stores, state.stores.join(","));
+    }
+    state.storeId = id;
+    e.target.value = "";
+    renderStores();
+    onStoreChanged();
+  });
+
+  $("store-select").addEventListener("change", function (e) {
+    state.storeId = e.target.value;
+    store(STORAGE.store, state.storeId);
+    onStoreChanged();
+  });
+
+  function onStoreChanged() {
+    state.labels.clear();
+    renderGrid();
+    refreshOverview();
+    // Narrow the live subscription in place rather than reconnecting: the
+    // socket already carries an authenticated, tenant-bound session and
+    // tearing it down to change a filter would drop events in the gap.
+    if (state.socket && state.socket.readyState === 1) {
+      state.socket.send(JSON.stringify({ type: "subscribe", stores: state.storeId ? [state.storeId] : [] }));
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // The live stream
+  // -----------------------------------------------------------------------
+  function streamStatus(text, cls) {
+    $("stream-text").textContent = text;
+    $("stream-dot").className = "dot" + (cls ? " " + cls : "");
+  }
+
+  function connect() {
+    if (!state.credential) { toast("Enter a credential first.", "bad"); return; }
+    disconnect(true);
+    state.manualClose = false;
+
+    var scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+    var url = scheme + "//" + window.location.host + "/v1/stream";
+    if (state.storeId) url += "?stores=" + encodeURIComponent(state.storeId);
+
+    // A browser cannot set Authorization on a WebSocket. The credential goes
+    // in the subprotocol list instead of the query string, because a query
+    // string is written to every access log between here and the gateway.
+    var protocols = ["usslp.v1", "usslp.credential." + state.credential];
+    var socket;
+    try {
+      socket = new WebSocket(url, protocols);
+    } catch (err) {
+      streamStatus("failed", "down");
+      toast("Could not open the stream: " + err.message, "bad");
+      return;
+    }
+    state.socket = socket;
+    streamStatus("connecting", "warn");
+
+    socket.onopen = function () {
+      state.reconnectDelay = 500;
+      streamStatus("live", "live");
+    };
+    socket.onmessage = function (ev) {
+      var msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === "ready" || msg.type === "subscribed") {
+        streamStatus("live · " + (msg.stores && msg.stores.length ? msg.stores.join(",") : "all stores"), "live");
+        return;
+      }
+      if (msg.type === "error") { toast(msg.message || "stream error", "bad"); return; }
+      handleEvent(msg);
+    };
+    socket.onerror = function () { streamStatus("error", "down"); };
+    socket.onclose = function (ev) {
+      state.socket = null;
+      if (state.manualClose) { streamStatus("offline"); return; }
+      // 1013 is the gateway telling us this connection fell behind. The right
+      // response is to reconnect and resynchronise from the read models, not
+      // to assume we saw everything.
+      if (ev.code === 1013) {
+        toast("The stream dropped this connection for falling behind. Resynchronising.", "bad");
+        refreshOverview();
+      }
+      streamStatus("reconnecting in " + Math.round(state.reconnectDelay / 100) / 10 + "s", "warn");
+      window.setTimeout(connect, state.reconnectDelay);
+      state.reconnectDelay = Math.min(state.reconnectDelay * 2, 15000);
+    };
+  }
+
+  function disconnect(silent) {
+    state.manualClose = true;
+    if (state.socket) {
+      try { state.socket.close(1000, "console closing"); } catch (e) { /* already gone */ }
+      state.socket = null;
+    }
+    if (!silent) streamStatus("offline");
+  }
+
+  // -----------------------------------------------------------------------
+  // Event handling
+  // -----------------------------------------------------------------------
+  function handleEvent(ev) {
+    state.events++;
+    state.eventWindow.push(Date.now());
+    var payload = ev.payload || {};
+
+    switch (ev.event_type) {
+      case "label.price.updated":
+        onPriceUpdated(ev, payload);
+        break;
+      case "label.update.delivered":
+        onDelivered(ev, payload);
+        break;
+      case "label.update.failed":
+        markLabel(payload.label_id, { state: "bad", note: payload.reason || "delivery failed" });
+        logEvent(ev, "delivery failed: " + (payload.reason || ""), "bad");
+        break;
+      case "device.status.online":
+        markLabel(payload.label_id || ev.aggregate_id, { state: "ok" });
+        logEvent(ev, "device online", "ok");
+        break;
+      case "device.status.offline":
+        markLabel(payload.label_id || ev.aggregate_id, { state: "bad", note: "offline" });
+        logEvent(ev, "device offline", "bad");
+        break;
+      case "device.battery.critical":
+        logEvent(ev, "battery critical", "warn");
+        refreshOverview();
+        break;
+      case "mesh.topology.changed":
+        onMesh(payload);
+        logEvent(ev, "mesh topology changed (" + ((payload.nodes || []).length) + " nodes)");
+        break;
+      case "promotion.activated":
+        logEvent(ev, "promotion activated", "ok");
+        break;
+      case "ota.job.created":
+      case "ota.cohort.advanced":
+      case "ota.rollback.triggered":
+        logEvent(ev, ev.event_type.replace(/\./g, " "), "warn");
+        refreshOTA();
+        break;
+      default:
+        logEvent(ev, ev.event_type);
+    }
+  }
+
+  function onPriceUpdated(ev, p) {
+    var att = p.attestation || {};
+    markLabel(p.label_id, {
+      sku: p.sku, price: p.price, state: "pending", seq: p.sequence,
+      attested: !!att.sig, kid: att.kid || "", flash: true
+    });
+    pushPriceRow(ev, p, att);
+    logEvent(ev, (p.sku || "?") + " → " + money(p.price));
+  }
+
+  function onDelivered(ev, p) {
+    markLabel(p.label_id, { state: "ok", note: "delivered" });
+    var ms = typeof p.latency_ms === "number" ? p.latency_ms : null;
+    if (ms === null && ev.recorded_at && p.delivered_at) {
+      ms = new Date(p.delivered_at).getTime() - new Date(ev.recorded_at).getTime();
+    }
+    if (ms !== null && isFinite(ms) && ms >= 0) {
+      state.latencies.push({ ms: ms, at: Date.now(), labelId: p.label_id });
+      if (state.latencies.length > LATENCY_WINDOW) state.latencies.shift();
+      renderLatency();
+    }
+    logEvent(ev, "delivered in " + (ms === null ? "?" : ms + " ms") +
+      (p.mesh_hops ? " · " + p.mesh_hops + " hops" : ""), ms !== null && ms > SLO_MS ? "bad" : "ok");
+  }
+
+  function onMesh(p) {
+    var nodes = p.nodes || [];
+    if (!nodes.length) return;
+    var online = nodes.filter(function (n) { return n.online; }).length;
+    var pct = Math.round(online / nodes.length * 100);
+    var risky = nodes.filter(function (n) { return (n.failure_risk || 0) > 0.5; }).length;
+    setBar("h-mesh-bar", pct, pct >= 95 ? "" : pct >= 85 ? "warn" : "bad");
+    $("h-mesh-text").textContent = online + " / " + nodes.length + " nodes routing" +
+      (risky ? " · " + risky + " links predicted to degrade" : "");
+  }
+
+  // -----------------------------------------------------------------------
+  // Label grid
+  // -----------------------------------------------------------------------
+  function markLabel(id, patch) {
+    if (!id) return;
+    var cur = state.labels.get(id) || { id: id, state: "idle" };
+    Object.keys(patch).forEach(function (k) { cur[k] = patch[k]; });
+    cur.at = Date.now();
+    state.labels.set(id, cur);
+    if (state.labels.size > GRID_MAX) {
+      var oldest = null;
+      state.labels.forEach(function (v, k) { if (!oldest || v.at < state.labels.get(oldest).at) oldest = k; });
+      if (oldest) state.labels.delete(oldest);
+    }
+    renderGrid();
+  }
+
+  function renderGrid() {
+    var host = $("label-grid-inner");
+    var rows = Array.from(state.labels.values()).sort(function (a, b) { return b.at - a.at; });
+    $("grid-empty").hidden = rows.length > 0;
+    $("grid-note").textContent = rows.length ? rows.length + " labels · newest first" : "waiting for events";
+    host.innerHTML = "";
+    rows.forEach(function (l) {
+      var cell = document.createElement("div");
+      cell.className = "lbl state-" + (l.state || "idle") + (l.flash ? " flash" : "");
+      cell.title = l.id + (l.note ? " · " + l.note : "") + (l.seq ? " · seq " + l.seq : "");
+      var att = document.createElement("span");
+      att.className = "att " + (l.attested ? "signed" : "unsigned");
+      att.textContent = l.attested ? "✓" : (l.price ? "!" : "");
+      att.title = l.attested ? ("attested, key " + (l.kid || "?")) : "no attestation on the last update";
+      cell.appendChild(att);
+      var id = document.createElement("div"); id.className = "id"; id.textContent = l.id;
+      var price = document.createElement("div"); price.className = "price"; price.textContent = money(l.price);
+      var sku = document.createElement("div"); sku.className = "sku"; sku.textContent = l.sku || "";
+      cell.appendChild(id); cell.appendChild(price); cell.appendChild(sku);
+      host.appendChild(cell);
+      l.flash = false;
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // Feeds
+  // -----------------------------------------------------------------------
+  function feedRow(host, emptyId, time, message, right, kind) {
+    var row = document.createElement("div");
+    row.className = "row";
+    var t = document.createElement("div"); t.className = "t"; t.textContent = time;
+    var m = document.createElement("div"); m.className = "m"; m.textContent = message;
+    var r = document.createElement("div");
+    r.className = "r";
+    if (kind) { var tag = document.createElement("span"); tag.className = "tag " + kind; tag.textContent = right; r.appendChild(tag); }
+    else { r.textContent = right || ""; }
+    row.appendChild(t); row.appendChild(m); row.appendChild(r);
+    host.insertBefore(row, host.firstChild);
+    while (host.children.length > FEED_MAX) host.removeChild(host.lastChild);
+    if (emptyId) $(emptyId).hidden = true;
+  }
+
+  function pushPriceRow(ev, p, att) {
+    feedRow($("price-feed-rows"), "price-feed-empty", clock(ev.recorded_at),
+      (p.sku || p.label_id || "?") + "  " + money(p.price) + (p.was_price ? "  was " + money(p.was_price) : ""),
+      att && att.sig ? "attested" : "unsigned",
+      att && att.sig ? "ok" : "bad");
+  }
+
+  function logEvent(ev, message, kind) {
+    feedRow($("event-rows"), null, clock(ev.recorded_at),
+      (ev.store_id ? ev.store_id + " · " : "") + message,
+      ev.event_type.split(".").pop(), kind);
+  }
+
+  // -----------------------------------------------------------------------
+  // Latency chart and error budget
+  // -----------------------------------------------------------------------
+  function renderLatency() {
+    var canvas = $("latency-chart");
+    var ctx = canvas.getContext ? canvas.getContext("2d") : null;
+    if (!ctx) return;
+
+    var ratio = window.devicePixelRatio || 1;
+    var cssW = canvas.clientWidth || 900, cssH = 190;
+    if (canvas.width !== Math.round(cssW * ratio)) {
+      canvas.width = Math.round(cssW * ratio);
+      canvas.height = Math.round(cssH * ratio);
+    }
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    var css = getComputedStyle(document.documentElement);
+    var colLine = css.getPropertyValue("--line").trim() || "#1f2833";
+    var colDim = css.getPropertyValue("--faint").trim() || "#5c6b7e";
+    var colOk = css.getPropertyValue("--ok").trim() || "#3fb950";
+    var colBad = css.getPropertyValue("--bad").trim() || "#f85149";
+    var colWarn = css.getPropertyValue("--warn").trim() || "#d29922";
+    var colInfo = css.getPropertyValue("--info").trim() || "#58a6ff";
+
+    var padL = 46, padR = 10, padT = 12, padB = 20;
+    var w = cssW - padL - padR, h = cssH - padT - padB;
+    var samples = state.latencies;
+    var peak = Math.max(SLO_MS * 1.35, 500);
+    samples.forEach(function (s) { if (s.ms > peak) peak = s.ms * 1.1; });
+
+    var y = function (ms) { return padT + h - (Math.min(ms, peak) / peak) * h; };
+
+    // horizontal guides
+    ctx.strokeStyle = colLine; ctx.fillStyle = colDim;
+    ctx.lineWidth = 1; ctx.font = "10px ui-monospace, monospace"; ctx.textAlign = "right";
+    [0, 0.25, 0.5, 0.75, 1].forEach(function (f) {
+      var ms = peak * f, py = Math.round(y(ms)) + 0.5;
+      ctx.beginPath(); ctx.moveTo(padL, py); ctx.lineTo(padL + w, py); ctx.stroke();
+      ctx.fillText((ms / 1000).toFixed(2) + "s", padL - 6, py + 3);
+    });
+
+    // the SLO line — the whole reason this chart exists
+    var sloY = Math.round(y(SLO_MS)) + 0.5;
+    ctx.save();
+    ctx.strokeStyle = colWarn; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(padL, sloY); ctx.lineTo(padL + w, sloY); ctx.stroke();
+    ctx.restore();
+    ctx.fillStyle = colWarn; ctx.textAlign = "left";
+    ctx.fillText("3.000s SLO", padL + 4, sloY - 4);
+
+    if (!samples.length) {
+      ctx.fillStyle = colDim; ctx.textAlign = "center";
+      ctx.fillText("no confirmed deliveries yet", padL + w / 2, padT + h / 2);
+      renderBudget();
+      return;
+    }
+
+    var step = samples.length > 1 ? w / (samples.length - 1) : 0;
+    samples.forEach(function (s, i) {
+      var px = padL + (samples.length > 1 ? i * step : w / 2);
+      var py = y(s.ms);
+      ctx.fillStyle = s.ms > SLO_MS ? colBad : colOk;
+      ctx.beginPath(); ctx.arc(px, py, 2.4, 0, Math.PI * 2); ctx.fill();
+    });
+
+    // rolling p99 line, computed over the trailing 30 samples
+    var sortedAll = samples.map(function (s) { return s.ms; }).sort(function (a, b) { return a - b; });
+    ctx.strokeStyle = colInfo; ctx.lineWidth = 1.5; ctx.beginPath();
+    var started = false;
+    for (var i = 0; i < samples.length; i++) {
+      var from = Math.max(0, i - 29);
+      var slice = samples.slice(from, i + 1).map(function (s) { return s.ms; }).sort(function (a, b) { return a - b; });
+      var px2 = padL + (samples.length > 1 ? i * step : w / 2);
+      var py2 = y(percentile(slice, 0.99));
+      if (!started) { ctx.moveTo(px2, py2); started = true; } else { ctx.lineTo(px2, py2); }
+    }
+    ctx.stroke();
+
+    $("b-p50").textContent = (percentile(sortedAll, 0.5) / 1000).toFixed(2) + "s";
+    var p99 = percentile(sortedAll, 0.99);
+    var p99el = $("b-p99");
+    p99el.textContent = (p99 / 1000).toFixed(2) + "s";
+    p99el.className = "v " + (p99 <= SLO_MS ? "ok" : "bad");
+    renderBudget();
+  }
+
+  function renderBudget() {
+    var samples = state.latencies;
+    var breaches = samples.filter(function (s) { return s.ms > SLO_MS; }).length;
+    $("b-count").textContent = String(samples.length);
+    var bel = $("b-breaches");
+    bel.textContent = String(breaches);
+    bel.className = "v " + (breaches === 0 ? "ok" : "bad");
+
+    if (!samples.length) {
+      setBar("b-burn-bar", 0, "");
+      $("b-burn-text").textContent = "no deliveries observed yet";
+      return;
+    }
+    // Budget = the share of deliveries allowed to miss. Burn is how much of
+    // that share this window has already spent.
+    var allowance = (1 - SLO_OBJECTIVE) * samples.length;
+    var burn = allowance > 0 ? breaches / allowance : (breaches ? 1 : 0);
+    var pct = Math.min(100, Math.round(burn * 100));
+    setBar("b-burn-bar", pct, pct < 60 ? "" : pct < 100 ? "warn" : "bad");
+    $("b-burn-text").textContent = breaches + " of " + samples.length + " deliveries over 3s — " +
+      pct + "% of the error budget for this window" +
+      (pct >= 100 ? " · objective missed" : "");
+  }
+
+  function setBar(id, pct, cls) {
+    var bar = $(id);
+    bar.style.width = Math.max(0, Math.min(100, pct)) + "%";
+    bar.className = cls || "";
+  }
+
+  // -----------------------------------------------------------------------
+  // Polled panels
+  // -----------------------------------------------------------------------
+  function refreshOverview() {
+    if (!state.credential || !state.storeId) return;
+    api("/v1/stores/" + encodeURIComponent(state.storeId) + "/overview")
+      .then(function (o) {
+        $("health-age").textContent = "as of " + clock(o.fetched_at) +
+          (o.degraded && o.degraded.length ? " · degraded: " + o.degraded.join(", ") : "");
+        applyHealth(o.health);
+        if (o.mesh) onMesh(o.mesh);
+        applySLO(o.slo);
+        applyOTA(o.ota);
+      })
+      .catch(function (err) {
+        $("health-age").textContent = "unavailable (" + err.message + ")";
+      });
+    api("/v1/pos/integrations").then(applyPOS).catch(function () { /* optional panel */ });
+  }
+
+  function applyHealth(h) {
+    if (!h) return;
+    var online = pick(h, ["labels_online", "online", "healthy"]);
+    var offline = pick(h, ["labels_offline", "offline"]);
+    var pending = pick(h, ["labels_pending", "pending"]);
+    var battery = pick(h, ["battery_warnings", "battery_critical", "low_battery"]);
+    setStat("h-online", online, "ok");
+    setStat("h-offline", offline, offline ? "bad" : "ok");
+    setStat("h-pending", pending, pending ? "warn" : "ok");
+    setStat("h-battery", battery, battery ? "warn" : "ok");
+  }
+
+  function applySLO(s) {
+    if (!s) return;
+    if (typeof s.p50_seconds === "number") $("b-p50").textContent = s.p50_seconds.toFixed(2) + "s";
+    if (typeof s.p99_seconds === "number") {
+      var el = $("b-p99");
+      el.textContent = s.p99_seconds.toFixed(2) + "s";
+      el.className = "v " + (s.p99_seconds <= 3 ? "ok" : "bad");
+    }
+    if (typeof s.labels_pending === "number") setStat("h-pending", s.labels_pending, s.labels_pending ? "warn" : "ok");
+  }
+
+  function applyOTA(o) {
+    var jobs = [];
+    if (Array.isArray(o)) jobs = o;
+    else if (o && Array.isArray(o.jobs)) jobs = o.jobs;
+    var host = $("ota-rows");
+    host.innerHTML = "";
+    $("ota-empty").hidden = jobs.length > 0;
+    jobs.slice(0, 8).forEach(function (j) {
+      var done = Number(j.completed || j.updated || 0);
+      var total = Number(j.total || j.devices || 0) || 1;
+      var pct = Math.min(100, Math.round(done / total * 100));
+      var wrap = document.createElement("div");
+      wrap.className = "pad";
+      wrap.style.borderBottom = "1px solid var(--line)";
+      var head = document.createElement("div");
+      head.style.cssText = "display:flex;gap:8px;font-family:var(--mono);font-size:11.5px";
+      head.innerHTML = "";
+      var name = document.createElement("span");
+      name.textContent = (j.from_version || "?") + " → " + (j.to_version || "?");
+      var st = document.createElement("span");
+      st.style.marginLeft = "auto";
+      st.className = "tag " + (j.state === "failed" || j.state === "rolled_back" ? "bad" : j.state === "paused" ? "warn" : "ok");
+      st.textContent = j.state || j.status || "running";
+      head.appendChild(name); head.appendChild(st);
+      var bar = document.createElement("div");
+      bar.className = "bar"; bar.style.margin = "6px 0 3px";
+      var fill = document.createElement("i"); fill.style.width = pct + "%";
+      bar.appendChild(fill);
+      var note = document.createElement("div");
+      note.className = "hint";
+      note.textContent = done + " / " + total + " devices · " + pct + "%" + (j.job_id ? " · " + j.job_id : "");
+      wrap.appendChild(head); wrap.appendChild(bar); wrap.appendChild(note);
+      host.appendChild(wrap);
+    });
+  }
+
+  function applyPOS(p) {
+    var rows = [];
+    if (Array.isArray(p)) rows = p;
+    else if (p && Array.isArray(p.bindings)) rows = p.bindings;
+    else if (p && Array.isArray(p.integrations)) rows = p.integrations;
+    var host = $("pos-rows");
+    host.innerHTML = "";
+    $("pos-empty").hidden = rows.length > 0;
+    if (!rows.length) return;
+    var table = document.createElement("table");
+    table.className = "list";
+    table.innerHTML = "<thead><tr><th>integration</th><th>adapter</th><th>state</th></tr></thead>";
+    var body = document.createElement("tbody");
+    rows.slice(0, 12).forEach(function (b) {
+      var tr = document.createElement("tr");
+      [b.name || b.binding_id || b.id || "—", b.adapter || b.kind || "—"].forEach(function (v) {
+        var td = document.createElement("td"); td.textContent = v; tr.appendChild(td);
+      });
+      var td = document.createElement("td");
+      var healthy = b.healthy !== false && b.state !== "failing";
+      var tag = document.createElement("span");
+      tag.className = "tag " + (healthy ? "ok" : "bad");
+      tag.textContent = b.state || (healthy ? "healthy" : "failing");
+      td.appendChild(tag); tr.appendChild(td);
+      body.appendChild(tr);
+    });
+    table.appendChild(body);
+    host.appendChild(table);
+  }
+
+  function pick(obj, keys) {
+    for (var i = 0; i < keys.length; i++) {
+      if (obj && typeof obj[keys[i]] === "number") return obj[keys[i]];
+    }
+    return null;
+  }
+  function setStat(id, value, cls) {
+    var el = $(id);
+    el.textContent = value === null || value === undefined ? "—" : String(value);
+    el.className = "v " + (value === null ? "" : cls);
+  }
+
+  // -----------------------------------------------------------------------
+  // Test price change
+  // -----------------------------------------------------------------------
+  $("test-price-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    if (!state.storeId) { toast("Select a store first.", "bad"); return; }
+    var amount = parseInt($("tp-amount").value, 10);
+    if (!isFinite(amount)) { toast("Price must be an integer number of minor units.", "bad"); return; }
+    var button = $("tp-submit");
+    button.disabled = true;
+    api("/v1/prices", {
+      method: "POST",
+      body: {
+        store_id: state.storeId,
+        sku: $("tp-sku").value.trim(),
+        price: { amount: amount, currency: ($("tp-currency").value || "GBP").toUpperCase() },
+        reason: $("tp-reason").value.trim(),
+        idempotency_key: "console-" + Date.now()
+      }
+    }).then(function (report) {
+      toast("Accepted: " + (report && report.applied !== undefined
+        ? report.applied + " applied, " + (report.scheduled || 0) + " scheduled, " + (report.rejected || 0) + " rejected"
+        : "watch the grid"), "ok");
+    }).catch(function (err) {
+      toast("Refused (" + err.status + " " + (err.code || "") + "): " + err.message, "bad");
+    }).then(function () { button.disabled = false; });
+  });
+
+  // -----------------------------------------------------------------------
+  // Wiring
+  // -----------------------------------------------------------------------
+  $("credential").value = state.credential;
+  $("connect").addEventListener("click", function () {
+    state.credential = $("credential").value.trim();
+    store(STORAGE.cred, state.credential);
+    loadIdentity()
+      .then(function () { connect(); refreshOverview(); })
+      .catch(function (err) {
+        $("identity").textContent = "not authenticated";
+        toast("Authentication failed (" + (err.status || "?") + "): " + err.message, "bad");
+      });
+  });
+  $("credential").addEventListener("keydown", function (e) { if (e.key === "Enter") $("connect").click(); });
+
+  window.addEventListener("resize", renderLatency);
+  window.addEventListener("beforeunload", function () { disconnect(true); });
+
+  window.setInterval(refreshOverview, POLL_MS);
+  window.setInterval(function () {
+    var cutoff = Date.now() - 5000;
+    state.eventWindow = state.eventWindow.filter(function (t) { return t > cutoff; });
+    $("event-rate").textContent = (state.eventWindow.length / 5).toFixed(1) + " /s";
+  }, 1000);
+
+  renderLatency();
+  renderStores();
+  if (state.credential) $("connect").click();
+})();
+</script>
+</body>
+</html>

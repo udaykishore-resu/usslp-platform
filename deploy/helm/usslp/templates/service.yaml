@@ -1,0 +1,74 @@
+{{- range $name, $svc := .Values.services }}
+{{- if $svc.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "usslp.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "usslp.serviceLabels" (dict "ctx" $ "name" $name "svc" $svc) | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  type: ClusterIP
+  ports:
+    {{- range $portName, $portNumber := $svc.ports }}
+    - name: {{ $portName }}
+      port: {{ $portNumber }}
+      targetPort: {{ $portName }}
+      protocol: TCP
+      {{- if eq $portName "http" }}
+      # Istio and the Gateway API both route on the appProtocol/port-name
+      # convention. Naming it explicitly stops a plain-TCP passthrough being
+      # inferred for what is really HTTP/1.1.
+      appProtocol: http
+      {{- end }}
+      {{- if eq $portName "mqtt" }}
+      appProtocol: tcp
+      {{- end }}
+    {{- end }}
+  selector:
+    {{- include "usslp.serviceSelectorLabels" (dict "ctx" $ "name" $name) | nindent 4 }}
+{{- if eq (default "Deployment" $svc.kind) "StatefulSet" }}
+---
+# The headless Service is what gives each broker pod a stable DNS name, which is
+# both how EMQX's Kubernetes discovery finds its peers and how a reconnecting
+# client lands back on the node holding its persistent session.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "usslp.fullname" $ }}-{{ $name }}-headless
+  labels:
+    {{- include "usslp.serviceLabels" (dict "ctx" $ "name" $name "svc" $svc) | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+    # EMQX discovery must see a peer's DNS record before it is ready, or the
+    # cluster never forms: the nodes are only ready once they have clustered.
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    {{- range $portName, $portNumber := $svc.ports }}
+    - name: {{ $portName }}
+      port: {{ $portNumber }}
+      targetPort: {{ $portName }}
+      protocol: TCP
+    {{- end }}
+    # The Erlang distribution ports. Cluster traffic only; no client ever
+    # connects to them, and the NetworkPolicy restricts them to the broker's
+    # own pods.
+    - name: ekka
+      port: 4370
+      targetPort: 4370
+      protocol: TCP
+    - name: ekka-rpc
+      port: 5370
+      targetPort: 5370
+      protocol: TCP
+  selector:
+    {{- include "usslp.serviceSelectorLabels" (dict "ctx" $ "name" $name) | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}

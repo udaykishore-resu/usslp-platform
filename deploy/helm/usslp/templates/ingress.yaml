@@ -1,0 +1,66 @@
+{{- if .Values.ingress.enabled }}
+{{- range $name, $svc := .Values.services }}
+{{- if and $svc.enabled $svc.ingressPaths }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "usslp.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "usslp.serviceLabels" (dict "ctx" $ "name" $name "svc" $svc) | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "20"
+    {{- with $.Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if eq $name "pos-integration-gw" }}
+    # A retailer's nightly price load is a large body, and the gateway's own
+    # limit is USSLP_UIG_MAX_BODY_BYTES. The proxy's limit must not be the
+    # tighter of the two, or the gateway's own 413 — which carries a useful
+    # message and is counted in usslp_uig_ingest_total — is replaced by the
+    # proxy's, which is neither.
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    # The gateway answers a POS the instant a change is durable, inside 50 ms.
+    # A 60-second proxy timeout is not for the happy path; it is so that a
+    # slow adapter callback is failed by the gateway's own logic rather than
+    # cut off mid-publish by the proxy.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    {{- end }}
+    {{- if eq $name "label-service" }}
+    # A store-wide batch legitimately takes tens of seconds — the binary's own
+    # WriteTimeout is 120s for exactly this reason — so the proxy must not give
+    # up first.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
+    {{- end }}
+    {{- if eq $name "device-registry" }}
+    # The largest legitimate request is a hypermarket's whole planogram, which
+    # is megabytes over a link that may be a store's broadband.
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
+    {{- end }}
+spec:
+  ingressClassName: {{ $.Values.ingress.className }}
+  {{- if $.Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $.Values.ingress.host }}
+      secretName: {{ $.Values.ingress.tls.secretName }}
+  {{- end }}
+  rules:
+    - host: {{ $.Values.ingress.host }}
+      http:
+        paths:
+          {{- range $p := $svc.ingressPaths }}
+          - path: {{ $p.path }}
+            pathType: {{ $p.pathType }}
+            backend:
+              service:
+                name: {{ include "usslp.fullname" $ }}-{{ $name }}
+                port:
+                  name: http
+          {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

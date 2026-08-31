@@ -1,0 +1,347 @@
+# USSLP Store Gateway Unit on K3s.
+#
+# ===========================================================================
+# When to use this instead of the systemd units
+# ===========================================================================
+# Both are supported and neither is a fallback for the other.
+#
+# The systemd units (deploy/edge/systemd/) are the right choice for the common
+# case: one box, one gateway, a store with no on-site technical staff. systemd
+# is already on the box, the hardening directives are stronger than anything a
+# K3s PodSecurity standard gives, and there is no cluster to go wrong at 2 a.m.
+# in a store in a different time zone.
+#
+# K3s is the right choice when the store gateway hardware is also running other
+# workloads the retailer manages — a shrink-analytics container, a
+# camera-inference sidecar, a queue-management app — and the retailer wants one
+# scheduler over all of it. It is also the right choice for a large-format store
+# with two gateway boxes in an active/standby pair, where the lease-based leader
+# election below is what stops both of them bridging to the cloud at once.
+#
+# Apply with:
+#   k3s kubectl apply -f deploy/edge/k3s/
+#
+# K3s' manifest auto-deploy directory works too: drop these into
+# /var/lib/rancher/k3s/server/manifests/ and the server applies them on boot,
+# which is what makes a store gateway self-healing after a power cut with no
+# network.
+#
+# ===========================================================================
+# Two things that are deliberately different from the cloud chart
+# ===========================================================================
+# 1. hostNetwork: true. The store's controllers reach the broker at a fixed
+#    LAN address, and a store LAN has no cluster DNS, no ingress and often
+#    static DHCP reservations written on a label on the box. A ClusterIP would
+#    require the controllers to know about K3s, which inverts the tier model —
+#    tier 2 talks to tier 3, not to tier 3's orchestrator.
+#
+#    The deploy/policy Kyverno policy forbids hostNetwork. That policy applies
+#    to the `usslp` namespace in the *cloud* clusters; this is a different
+#    cluster with a different threat model, and the difference is stated here
+#    rather than being an accidental gap.
+#
+# 2. A PersistentVolumeClaim on local-path storage. The gateway's durable store
+#    holds the upstream queue — the record of everything that happened while the
+#    WAN was down. An emptyDir would discard it on every pod restart, which
+#    would make a gateway restart during an outage into permanent data loss.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: usslp-edge
+  labels:
+    app.kubernetes.io/part-of: usslp
+    # Baseline, not restricted: hostNetwork is required and `restricted`
+    # forbids it. The compensating controls are that this is a single-tenant
+    # box in a locked cabinet and that the container still runs non-root with
+    # a read-only root filesystem.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: usslp-sgu
+  namespace: usslp-edge
+automountServiceAccountToken: true
+# The token is mounted because the gateway participates in the lease-based
+# leader election below when two gateway boxes are paired. A single-box store
+# can set this to false.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: usslp-sgu-lease
+  namespace: usslp-edge
+rules:
+  # Leader election for an active/standby gateway pair. Both boxes run the
+  # broker; only the holder of the lease bridges to the cloud. Two gateways
+  # bridging the same store means every upstream message is delivered twice and
+  # every downstream retained message races.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: usslp-sgu-lease
+  namespace: usslp-edge
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: usslp-sgu-lease
+subjects:
+  - kind: ServiceAccount
+    name: usslp-sgu
+    namespace: usslp-edge
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: usslp-sgu-config
+  namespace: usslp-edge
+data:
+  # Non-secret configuration only. The MQTT credentials and the key ring are in
+  # the Secret below, mounted as files, because config.Loader resolves
+  # NAME_FILE before NAME.
+  USSLP_ENVIRONMENT: "prod"
+  USSLP_LOG_LEVEL: "info"
+  USSLP_LOG_FORMAT: "json"
+  USSLP_ENABLE_PPROF: "false"
+  USSLP_TRACE_SAMPLE_ONE_IN: "100"
+
+  USSLP_BROKER_ADDR: "0.0.0.0:1883"
+  USSLP_GATEWAY_ADDR: "0.0.0.0:8090"
+  USSLP_ADMIN_ADDR: "0.0.0.0:9090"
+  USSLP_DATA_DIR: "/var/lib/usslp"
+
+  # WAN detection. See the comments in deploy/edge/config/sgu.env.template for
+  # why these are asymmetric.
+  USSLP_PROBE_INTERVAL: "5s"
+  USSLP_PROBE_TIMEOUT: "3s"
+  USSLP_WAN_FAIL_THRESHOLD: "3"
+  USSLP_WAN_FAIL_FOR: "12s"
+  USSLP_WAN_RECOVER_THRESHOLD: "4"
+  USSLP_WAN_RECOVER_FOR: "15s"
+
+  USSLP_QUEUE_MAX_ENTRIES: "50000"
+  USSLP_QUEUE_MAX_MB: "256"
+  USSLP_SHUTDOWN_GRACE: "20s"
+
+  # Store identity. Written per store by the provisioning process; these are
+  # placeholders and the gateway refuses to start with them unset.
+  USSLP_STORE_ID: "REPLACE-ME"
+  USSLP_TENANT_ID: "REPLACE-ME"
+  USSLP_SGU_ID: "REPLACE-ME"
+  USSLP_REGION: "us-east-1"
+  USSLP_CLOUD_BROKER_URL: "REPLACE-ME"
+---
+# The Secret is NOT in this file, deliberately. Store credentials are per-store
+# and come from the platform's key ceremony; a manifest in a Git repository must
+# not contain one. Create it out of band:
+#
+#   k3s kubectl -n usslp-edge create secret generic usslp-sgu-secrets \
+#     --from-file=mqtt-username=./mqtt-username \
+#     --from-file=mqtt-password=./mqtt-password \
+#     --from-file=keyring.json=./keyring.json
+#
+# There is no External Secrets Operator here: a store gateway is a device that
+# is not running a cluster with an operator in it, which is precisely why
+# config.Loader supports the NAME_FILE indirection at all.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: usslp-sgu-state
+  namespace: usslp-edge
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # K3s' built-in local-path provisioner. On a single box there is nowhere else
+  # for the data to be, and the data is genuinely local: it is this store's
+  # record of this store's outage.
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: usslp-sgu
+  namespace: usslp-edge
+  labels:
+    app.kubernetes.io/name: usslp-sgu
+    app.kubernetes.io/component: sgu
+    app.kubernetes.io/part-of: usslp
+spec:
+  serviceName: usslp-sgu
+  replicas: 1
+  # A StatefulSet rather than a Deployment, and replicas: 1 rather than 2.
+  #
+  # The state is the point: the durable store holds the upstream queue and the
+  # store's replica of every label's current price. A Deployment's rolling
+  # update would run two pods against one PVC, and RWO would either refuse the
+  # second or — worse, on a single node — admit it and let two processes write
+  # the same write-ahead log.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: usslp-sgu
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: usslp-sgu
+        app.kubernetes.io/component: sgu
+        app.kubernetes.io/part-of: usslp
+    spec:
+      serviceAccountName: usslp-sgu
+      # See the header. The controllers reach the broker at the box's LAN
+      # address; a store LAN has no cluster DNS.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Recreate, not rolling: one PVC, one writer.
+      terminationGracePeriodSeconds: 45
+      # Longer than USSLP_SHUTDOWN_GRACE (20s) so the queue flush finishes.
+      priorityClassName: system-node-critical
+      # The gateway is the store. If anything on this box is evicted under
+      # pressure it must not be this.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sgu
+          image: ghcr.io/usslp/sgu:REPLACE-ME
+          imagePullPolicy: IfNotPresent
+          # IfNotPresent, never Always. A store whose WAN is down must be able
+          # to restart its gateway from the local image cache — which is the
+          # exact moment it most needs to.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: mqtt
+              containerPort: 1883
+              protocol: TCP
+            - name: diagnostics
+              containerPort: 8090
+              protocol: TCP
+            - name: admin
+              containerPort: 9090
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: usslp-sgu-config
+          env:
+            # config.Loader reads NAME_FILE before NAME, so these point at the
+            # projected secret and the values never appear in the pod spec, in
+            # `kubectl describe`, or in this repository.
+            - name: USSLP_MQTT_USERNAME_FILE
+              value: /run/secrets/usslp/mqtt-username
+            - name: USSLP_MQTT_PASSWORD_FILE
+              value: /run/secrets/usslp/mqtt-password
+            - name: USSLP_KEYRING_FILE
+              value: /run/secrets/usslp/keyring.json
+          livenessProbe:
+            # /healthz answers 200 unconditionally: it asks only whether the
+            # process is scheduling goroutines. That is the whole point — a
+            # cloud broker blip must not restart the gateway, because the
+            # gateway is what is keeping the store's shelves priced while the
+            # cloud is unreachable.
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            # /readyz runs the gateway's registered checks: the store's broker
+            # is listening, the durable store is writable, the upstream buffer
+            # is not full. Note what is NOT checked: the cloud. A store gateway
+            # has no load balancer in front of it and nowhere else for its
+            # controllers to go, so an unreachable cloud must not make it look
+            # unhealthy.
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 5
+            # Five minutes. Recovering a large durable store after an unclean
+            # shutdown means replaying the write-ahead log, and a hypermarket's
+            # store is not small.
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/usslp
+            - name: secrets
+              mountPath: /run/secrets/usslp
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: usslp-sgu-state
+        - name: secrets
+          secret:
+            secretName: usslp-sgu-secrets
+            defaultMode: 0400
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+          # readOnlyRootFilesystem is true, so anything that writes to /tmp
+          # needs this. In-memory so it never touches the box's flash, which on
+          # an appliance has a write-cycle budget.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: usslp-sgu
+  namespace: usslp-edge
+  labels:
+    app.kubernetes.io/name: usslp-sgu
+    app.kubernetes.io/part-of: usslp
+spec:
+  # ClusterIP for anything else on this box that wants to reach the gateway.
+  # The controllers do not use it — they reach the host's LAN address directly,
+  # which is what hostNetwork above provides.
+  type: ClusterIP
+  ports:
+    - name: mqtt
+      port: 1883
+      targetPort: 1883
+    - name: diagnostics
+      port: 8090
+      targetPort: 8090
+    - name: admin
+      port: 9090
+      targetPort: 9090
+  selector:
+    app.kubernetes.io/name: usslp-sgu

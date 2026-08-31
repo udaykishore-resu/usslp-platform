@@ -1,0 +1,425 @@
+# USSLP — Argo Rollouts AnalysisTemplates.
+#
+# ---------------------------------------------------------------------------
+# What these do
+# ---------------------------------------------------------------------------
+# At each canary step the Rollout runs these queries against Prometheus. If a
+# measurement fails `failureLimit` times, the rollout aborts and Argo Rollouts
+# shifts 100% of traffic back to the stable ReplicaSet — automatically, in
+# seconds, with no human in the loop.
+#
+# Every query below uses a metric that is registered in the Go tree. That is
+# the point of the whole file: an analysis whose query names a metric that does
+# not exist returns "no data", and the default `failOnNoData` behaviour is to
+# *pass*. A canary gated on a typo is a canary with no gate, and it looks
+# identical to a working one on the dashboard.
+#
+# So: every template sets a count, every query is restricted to the canary pods
+# by a label the Rollout injects, and the metric names are checked against the
+# Go source by deploy/observability/verify-metrics.py in CI.
+#
+# ---------------------------------------------------------------------------
+# The label the queries filter on
+# ---------------------------------------------------------------------------
+# obs.NewRuntime attaches `service`, `version`, `region` and `instance` as const
+# labels on every series (platform/pkg/obs/runtime.go). `version` is the one
+# that separates canary from stable: the canary runs a different image tag, and
+# the image tag is what USSLP_VERSION is set to by the chart. So the queries
+# below filter on version rather than on a pod-hash label, and the Rollout
+# passes the new version in as an argument.
+#
+# This is more robust than filtering on a Kubernetes label, because it works
+# even when the metric is aggregated through a recording rule that dropped the
+# pod label.
+
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: usslp-success-rate
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  args:
+    - name: service
+    - name: canary-version
+    - name: prometheus-url
+      value: http://prometheus-operated.monitoring.svc.cluster.local:9090
+  metrics:
+    - name: request-success-rate
+      # Five measurements a minute apart. One measurement is noise; five is a
+      # trend, and five minutes is short enough that a bad canary is caught
+      # before it has served much traffic.
+      interval: 1m
+      count: 5
+      # Two failures, not one. A single scrape landing mid-restart on a pod
+      # that has just come up will show a burst of errors that means nothing.
+      failureLimit: 2
+      # Do NOT pass on no data. A canary with no traffic has not been proven,
+      # and treating "we learned nothing" as "it is fine" is exactly the
+      # failure this file exists to prevent.
+      failOnInconclusive: true
+      successCondition: result[0] >= 0.995
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            sum(rate(usslp_requests_total{
+              service="{{ args.service }}",
+              version="{{ args.canary-version }}",
+              outcome="ok"
+            }[2m]))
+            /
+            sum(rate(usslp_requests_total{
+              service="{{ args.service }}",
+              version="{{ args.canary-version }}"
+            }[2m]))
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: usslp-request-latency
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  args:
+    - name: service
+    - name: canary-version
+    - name: p99-threshold-seconds
+      value: "0.5"
+    - name: prometheus-url
+      value: http://prometheus-operated.monitoring.svc.cluster.local:9090
+  metrics:
+    - name: request-latency-p99
+      interval: 1m
+      count: 5
+      failureLimit: 2
+      failOnInconclusive: true
+      successCondition: result[0] <= {{ args.p99-threshold-seconds }}
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          # obs.LatencyBuckets is the histogram's bucket set; the exposition
+          # renders the boundaries with FormatFloat(f, 'g', -1, 64), so
+          # histogram_quantile over the _bucket series is exactly the same
+          # approximation Histogram.Quantile makes in-process.
+          query: |
+            histogram_quantile(0.99,
+              sum by (le) (rate(usslp_request_duration_seconds_bucket{
+                service="{{ args.service }}",
+                version="{{ args.canary-version }}"
+              }[2m]))
+            )
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: usslp-price-path-latency
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+  annotations:
+    usslp.io/purpose: >-
+      The Label Service's own gate. A canary that answers HTTP quickly but takes
+      four seconds to get a price onto a shelf has passed every generic check
+      and broken the only SLO that matters.
+spec:
+  args:
+    - name: canary-version
+    - name: prometheus-url
+      value: http://prometheus-operated.monitoring.svc.cluster.local:9090
+  metrics:
+    - name: price-path-within-3s
+      # Longer interval and more measurements than the generic checks. The
+      # end-to-end number includes a 2-second E-Ink refresh at the far end, so
+      # a 2-minute rate window is the shortest that is not dominated by
+      # in-flight updates that have not landed yet.
+      interval: 2m
+      count: 5
+      failureLimit: 1
+      failOnInconclusive: true
+      # 99% within 3 seconds — the SLO itself, not a proxy for it.
+      successCondition: result[0] >= 0.99
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            sum(rate(usslp_price_update_e2e_seconds_bucket{
+              le="3",
+              version="{{ args.canary-version }}"
+            }[5m]))
+            /
+            sum(rate(usslp_price_update_e2e_seconds_count{
+              version="{{ args.canary-version }}"
+            }[5m]))
+    - name: no-attestation-failures
+      interval: 2m
+      count: 5
+      # Zero tolerance, and therefore failureLimit 0: one measurement showing a
+      # signing failure aborts the rollout. A label never displays a price it
+      # cannot verify, so a canary that cannot sign is a canary that is
+      # silently not doing its job.
+      failureLimit: 0
+      failOnInconclusive: false
+      successCondition: result[0] == 0
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            sum(increase(usslp_attestation_failures_total{
+              version="{{ args.canary-version }}"
+            }[5m])) or vector(0)
+    - name: delivery-confirmation-rate
+      interval: 2m
+      count: 5
+      failureLimit: 1
+      failOnInconclusive: true
+      successCondition: result[0] >= 0.98
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          # `duplicate` is excluded from both sides: a duplicated frame is
+          # at-least-once delivery working correctly, not a failure.
+          query: |
+            sum(rate(usslp_label_delivery_confirmations_total{
+              outcome="confirmed",
+              version="{{ args.canary-version }}"
+            }[5m]))
+            /
+            sum(rate(usslp_label_delivery_confirmations_total{
+              outcome=~"confirmed|failed",
+              version="{{ args.canary-version }}"
+            }[5m]))
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: usslp-pos-ingest-latency
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+spec:
+  args:
+    - name: canary-version
+    - name: prometheus-url
+      value: http://prometheus-operated.monitoring.svc.cluster.local:9090
+  metrics:
+    - name: ingest-p95
+      interval: 1m
+      count: 5
+      failureLimit: 2
+      failOnInconclusive: true
+      # The retailer-facing SLO is p95 < 500 ms. The gate is 250 ms: a canary
+      # that is already at the SLO boundary has no margin for the load it will
+      # take at 100%.
+      successCondition: result[0] <= 0.25
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            histogram_quantile(0.95,
+              sum by (le) (rate(usslp_uig_ingest_duration_seconds_bucket{
+                version="{{ args.canary-version }}"
+              }[2m]))
+            )
+    - name: budget-breach-rate
+      interval: 1m
+      count: 5
+      failureLimit: 2
+      failOnInconclusive: false
+      # The gateway's own 50 ms slice. Under 1% of deliveries may breach it.
+      successCondition: result[0] <= 0.01
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            (
+              sum(rate(usslp_uig_latency_budget_exceeded_total{version="{{ args.canary-version }}"}[2m]))
+              /
+              sum(rate(usslp_uig_ingest_total{version="{{ args.canary-version }}"}[2m]))
+            ) or vector(0)
+    - name: no-publish-failures
+      interval: 1m
+      count: 5
+      failureLimit: 0
+      failOnInconclusive: false
+      successCondition: result[0] == 0
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            sum(increase(usslp_uig_publish_failures_total{
+              version="{{ args.canary-version }}"
+            }[2m])) or vector(0)
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: usslp-process-health
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+  annotations:
+    usslp.io/purpose: >-
+      Catches the canary that is serving correctly and leaking. A goroutine or
+      heap leak does not show up in a success rate or a latency percentile
+      until the pod dies, which is after the rollout has finished.
+spec:
+  args:
+    - name: service
+    - name: canary-version
+    - name: prometheus-url
+      value: http://prometheus-operated.monitoring.svc.cluster.local:9090
+  metrics:
+    - name: goroutines-stable
+      interval: 2m
+      count: 5
+      failureLimit: 2
+      failOnInconclusive: false
+      # Not an absolute number — services legitimately differ by orders of
+      # magnitude. The check is that the canary is not more than 50% above the
+      # stable pods doing the same work.
+      successCondition: result[0] <= 1.5
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            (
+              avg(usslp_go_goroutines{service="{{ args.service }}", version="{{ args.canary-version }}"})
+              /
+              avg(usslp_go_goroutines{service="{{ args.service }}", version!="{{ args.canary-version }}"})
+            ) or vector(1)
+    - name: gc-pause-acceptable
+      interval: 2m
+      count: 5
+      failureLimit: 2
+      failOnInconclusive: false
+      # 100 ms is two thirds of the MQTT publish budget.
+      successCondition: result[0] <= 0.1
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            max(usslp_go_gc_pause_p99_seconds{
+              service="{{ args.service }}",
+              version="{{ args.canary-version }}"
+            }) or vector(0)
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: usslp-consumer-lag
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+  annotations:
+    usslp.io/purpose: >-
+      A canary that consumes more slowly than stable falls behind without ever
+      returning an error. Lag is the only signal that sees it.
+spec:
+  args:
+    - name: canary-version
+    - name: max-lag
+      value: "50000"
+    - name: prometheus-url
+      value: http://prometheus-operated.monitoring.svc.cluster.local:9090
+  metrics:
+    - name: consumer-lag-bounded
+      interval: 2m
+      count: 5
+      failureLimit: 2
+      failOnInconclusive: false
+      successCondition: result[0] <= {{ args.max-lag }}
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            max(sum by (topic, group) (usslp_consumer_lag_records{
+              version="{{ args.canary-version }}"
+            })) or vector(0)
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: usslp-gateway-health
+  namespace: usslp
+  labels:
+    app.kubernetes.io/part-of: usslp
+  annotations:
+    usslp.io/purpose: >-
+      The API gateway's own gate. A canary that answers quickly while opening
+      circuit breakers, recovering panics or evicting WebSocket streams has
+      passed every generic check and is quietly failing every retailer.
+spec:
+  args:
+    - name: canary-version
+    - name: prometheus-url
+      value: http://prometheus-operated.monitoring.svc.cluster.local:9090
+  metrics:
+    - name: no-new-breakers-open
+      interval: 1m
+      count: 5
+      failureLimit: 1
+      failOnInconclusive: false
+      # usslp_gateway_breaker_state is a one-hot gauge set: one series per
+      # state carrying 0 or 1 (platform/internal/apigw/metrics.go). So the
+      # query sums the "open" series rather than testing a numeric encoding.
+      #
+      # Zero, because every upstream the gateway names is now a service the
+      # chart deploys. The threshold used to be 1 to tolerate an `analytics`
+      # breaker that sat open while that service had no binary; it has one, it
+      # is enabled, and an open breaker is a fault again.
+      successCondition: result[0] == 0
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            sum(usslp_gateway_breaker_state{
+              state="open",
+              version="{{ args.canary-version }}"
+            }) or vector(0)
+    - name: no-panics
+      interval: 1m
+      count: 5
+      # Zero tolerance. A recovered panic is a bug that reached production; the
+      # gateway keeps serving, which is exactly why it must not be allowed
+      # through a canary gate.
+      failureLimit: 0
+      failOnInconclusive: false
+      successCondition: result[0] == 0
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            sum(increase(usslp_gateway_panics_total{
+              version="{{ args.canary-version }}"
+            }[2m])) or vector(0)
+    - name: upstream-failure-rate
+      interval: 1m
+      count: 5
+      failureLimit: 2
+      failOnInconclusive: true
+      successCondition: result[0] <= 0.01
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            (
+              sum(rate(usslp_gateway_upstream_failures_total{version="{{ args.canary-version }}"}[2m]))
+              /
+              sum(rate(usslp_gateway_requests_total{version="{{ args.canary-version }}"}[2m]))
+            ) or vector(0)
+    - name: stream-evictions-bounded
+      interval: 2m
+      count: 5
+      failureLimit: 2
+      failOnInconclusive: false
+      successCondition: result[0] <= 0.5
+      provider:
+        prometheus:
+          address: "{{ args.prometheus-url }}"
+          query: |
+            sum(rate(usslp_gateway_stream_evictions_total{
+              version="{{ args.canary-version }}"
+            }[5m])) or vector(0)
