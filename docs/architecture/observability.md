@@ -11,6 +11,48 @@ code**: `make verify-metrics` extracts every metric registered through
 expression that evaluates to nothing, forever, silently, and an alert that can
 never fire looks exactly like coverage.
 
+Where each signal starts, what carries it, and where it stops. Two of the three
+arrive somewhere useful; the third is drawn as it actually is.
+
+```mermaid
+flowchart TB
+  subgraph M["Metrics - no exporter, no adapter, no push gateway"]
+    APP["obs.Registry writes the Prometheus text exposition<br/>format directly. Four const labels from obs.NewRuntime -<br/>service, version, region, instance"]
+    ADM["obs.AdminServer serves /metrics on the admin port"]
+    SM["One ServiceMonitor per service, interval 15s,<br/>honorLabels true, per-partition series dropped at scrape"]
+    PROM["Prometheus - recording rules, then the SLO alerts<br/>and the 42 component alerts"]
+    OC["Collector prometheus receiver scrapes the same admin<br/>ports, drops eventlog_segments and deletes the<br/>partition attribute from both lag metrics"]
+    LTS["Collector prometheus exporter on 8889,<br/>for the long-term store"]
+  end
+  subgraph T["Traces"]
+    TR["obs.Tracer. W3C traceparent over HTTP headers,<br/>event-bus headers and MQTT payload metadata.<br/>StartAlwaysSampled on the price path"]
+    LE["obs.LogExporter writes each finished span as a<br/>JSON log line whose msg is span"]
+    FL["Collector filelog receiver reads /var/log/pods/usslp_*<br/>and keeps only the lines whose msg is span"]
+    ENV["Envoy sidecars export OTLP directly. Telemetry<br/>randomSamplingPercentage 1.0, joined to the<br/>application trace by the propagated trace id"]
+    TS["tail_sampling - errors, anything over 1000 ms,<br/>10 percent of the price path, 1 percent baseline"]
+    JG["otlp/traces exporter to jaeger:4317"]
+  end
+  subgraph L["Logs"]
+    LG["obs.Logger over log/slog. JSON in prod, and every line<br/>emitted in a request carries the trace and tenant context"]
+    NOP["There is no logs pipeline in otel-collector.yaml.<br/>filelog drops every non-span line, so ordinary logs go<br/>to whatever the cluster runs"]
+  end
+  GAP1["NOT REAL - no OTLP exporter in pkg/obs. Spans reach a<br/>backend only across this log bridge, thinned by<br/>USSLP_SPAN_LOG_ONE_IN, default 100 in production"]
+  GAP2["NOT REAL - edge/sgu and edge/sec construct no tracer<br/>at all. The store tier emits metrics and log lines,<br/>and no spans of its own"]
+  APP --> ADM
+  ADM --> SM
+  SM --> PROM
+  ADM --> OC
+  OC --> LTS
+  TR --> LE
+  LE --> FL
+  FL --> TS
+  ENV --> TS
+  TS --> JG
+  LG --> NOP
+  LE --- GAP1
+  TR --- GAP2
+```
+
 ---
 
 ## 1. Metrics
@@ -313,6 +355,47 @@ hour.
 | 3× over 1 d, confirmed by 2 h | 10% of the budget in a day | ticket |
 | 1× over 3 d, confirmed by 6 h | the slow leak that misses the month without ever spiking | ticket |
 
+The same scheme as a path from a raw series to somebody's phone. The two
+exceptions and the informational group are on it deliberately: they are the
+parts that do not follow the pattern.
+
+```mermaid
+flowchart TB
+  RAW["Raw series - usslp_price_update_e2e_seconds,<br/>usslp_requests_total, usslp_uig_ingest_duration_seconds,<br/>ota_device_outcomes_total, registry_devices,<br/>up for sgu, usslp_process_uptime_seconds"]
+  REC["Recording rules, one ratio per SLO per window -<br/>usslp:sli_NAME:error_ratio at 5m, 30m, 1h, 2h, 6h, 1d, 3d.<br/>Label online is a gauge ratio averaged over the window,<br/>and OTA has no 5m window at all"]
+  BUD["Budgets, written out rather than computed -<br/>0.01 price path, 0.0005 cloud API, 0.05 POS ingest,<br/>0.003 OTA, 0.005 label online, 0.001 SGU uptime"]
+  PAIR{"long window and short window<br/>both above burn rate times budget"}
+  B144["14.4x, 1h confirmed by 5m -<br/>2 percent of the month in an hour"]
+  B6["6x, 6h confirmed by 30m -<br/>5 percent of the month in six hours"]
+  B3["3x, 1d confirmed by 2h -<br/>10 percent of the month in a day"]
+  B1["1x, 3d confirmed by 6h -<br/>the leak that misses the month without ever spiking"]
+  EXC1["Not a burn rate - USSLPAttestationFailure and<br/>USSLPControllerComplianceRefusal fire on any increase<br/>over 5 minutes, with for 2m. Labelled compliance true"]
+  EXC2["Not a burn rate - USSLPSGURestartLoop counts more than<br/>3 resets of usslp_process_uptime_seconds in an hour,<br/>which the uptime SLI structurally cannot see"]
+  INFO["USSLPPricePathBudgetNearlyExhausted -<br/>error_ratio3d above 0.008 for 6h, severity info,<br/>page false. The release freeze signal"]
+  COMP["42 component alerts sit below this layer and fire<br/>earlier. They are what turn a page into a diagnosis"]
+  PAGE["page true. Every alert carries a runbook_url, and the<br/>price-path alerts also carry hop_breakdown naming the<br/>four recording rules that localise it"]
+  TICK["page false. A ticket, with a working day"]
+  RAW --> REC
+  REC --> PAIR
+  BUD --> PAIR
+  PAIR --> B144
+  PAIR --> B6
+  PAIR --> B3
+  PAIR --> B1
+  B144 --> PAGE
+  B6 -->|"price path, cloud API, POS ingest"| PAGE
+  B6 -->|"OTA, label online, SGU uptime"| TICK
+  B3 --> TICK
+  B1 --> TICK
+  RAW --> EXC1
+  RAW --> EXC2
+  EXC1 --> PAGE
+  EXC2 --> PAGE
+  REC --> INFO
+  INFO --> TICK
+  COMP --> TICK
+```
+
 **The short window in each pair is what makes the alert stop.** A 1-hour-window
 alert with no short-window conjunct keeps firing for an hour after resolution,
 which is how an on-call engineer learns to ignore the resolution notification
@@ -361,6 +444,45 @@ Four boards, provisioned by the compose profiles.
 | `price-path-latency.json` | Where in the 3-second budget did the time go? Per hop against its budget, plus a **residual** panel |
 | `fleet-health.json` | Which stores are unhappy and why? A sortable "stores ranked by unhappiness" table, plus bridge and reconciliation, mesh (including predicted link failure risk for the top 10 links) and OTA |
 | `slo-error-budget.json` | How much budget is left, and should we deploy? Six gauges, four burn-rate charts, and the attestation panel with no budget |
+
+One price change, traced through what it emits rather than what it does. Read
+down the notes: every panel above is fed from this single path, and the gaps in
+it are the residual.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant POS as POS webhook
+  participant UIG as uig
+  participant BUS as price-updates
+  participant LS as label-service
+  participant MQ as Cloud MQTT
+  participant SGU as Store Gateway
+  participant SEC as Shelf Edge Controller
+  participant LBL as Label
+
+  POS->>UIG: signed webhook
+  Note over UIG: span uig.ingest, StartAlwaysSampled.<br/>usslp_uig_ingest_duration_seconds by adapter feeds<br/>Hop 1 - UIG ingest p99, budget 50 ms
+  UIG->>BUS: append PriceChangeRequested
+  Note over UIG: usslp_uig_ingest_total and usslp_requests_total feed<br/>POS ingest by adapter, and the cloud API SLO gauge
+  BUS->>LS: consume
+  Note over LS: span label.price.fanout.<br/>usslp_price_fanout_duration_seconds feeds Hop 3, and<br/>usslp_price_fanout_batch_size buckets to 100,000
+  Note over LS: a price the platform cannot sign increments<br/>usslp_attestation_failures_total, which has no budget<br/>and feeds Attestation and compliance refusals
+  LS->>MQ: publish PriceUpdated, QoS 1, retained
+  Note over LS: usslp_device_publish_duration_seconds feeds<br/>Hop 4 - MQTT device publish p99, budget 100 ms.<br/>usslp_labels_pending_delivery rises
+  MQ->>SGU: bridge downstream
+  Note over SGU: sgu_bridged_total by direction and outcome feeds<br/>Bridged messages on the fleet board. No span -<br/>the store tier constructs no tracer
+  SGU->>SEC: the store's own broker, inside the building
+  Note over SEC: the controller recomputes the digest and verifies it.<br/>sec_updates_total by outcome, and a refusal increments<br/>sec_compliance_alerts_total
+  SEC->>LBL: attested frame - the trace context does not cross the radio
+  LBL-->>SEC: ack
+  Note over SEC: sec_label_delivery_seconds by phase feeds<br/>Hop 6 - SEC to label p99 by phase, budget 400 ms
+  SEC-->>SGU: label.update.delivered carrying LatencyMS
+  SGU-->>MQ: bridged upstream
+  MQ-->>LS: label-delivery
+  Note over LS: span label.delivery.confirm. This is where<br/>usslp_price_update_e2e_seconds is observed, by tenant<br/>and store - the SLO, and the End to end panel
+  Note over UIG,LBL: residual is the e2e p99 minus the instrumented hops.<br/>UIG to stream, broker to SGU to SEC, the E-Ink refresh<br/>and the ACK back to cloud all fall into it
+```
 
 **The residual panel is the most useful single thing here.** It is end-to-end
 latency minus the sum of the instrumented hops, and a residual that grows while

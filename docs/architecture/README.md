@@ -25,7 +25,8 @@ in a *Divergence* note.
   (`platform/cmd/usslpd/stack/slo.go`) and checked against the Markdown by
   `TestLatencyBudgetMatchesTheContract`.
 - **Every diagram is Mermaid**, kept small enough to read. Where one picture
-  would sprawl, it is split.
+  would sprawl, it is split. All 84 of them are indexed by kind in
+  [`DIAGRAMS.md`](DIAGRAMS.md), and all 84 parse.
 
 ## The documents
 
@@ -38,6 +39,7 @@ in a *Divergence* note.
 | [`05-sequence-diagrams.md`](05-sequence-diagrams.md) | Behaviour | Ten end-to-end walkthroughs with budgets and measured latencies. **Start here if you are on call.** |
 | [`06-data-architecture.md`](06-data-architecture.md) | Data | Streams, CQRS split, aggregates, read models, the columnar store, edge stores, four state machines. |
 | [`07-flows.md`](07-flows.md) | Flows | Five human workflows and four of the platform's own decision procedures. |
+| [`DIAGRAMS.md`](DIAGRAMS.md) | Index | Every diagram in the repository, grouped by kind: context, component, block, sequence, state, ER, flowchart. |
 
 Companion documents in this directory and alongside it, produced separately and
 not maintained here: [`INTERFACE-CONTRACTS.md`](INTERFACE-CONTRACTS.md)

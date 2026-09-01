@@ -80,9 +80,13 @@ sequence is persisted: the panel is bistable, so the residue outlives a reboot.
 
 The driver adds one thing no policy above it can know: **below about −10 °C there
 is no partial waveform at all.** A single-phase drive does not complete and
-produces a smeared digit. The driver falls back to a full refresh and reports
-`ForcedFull`, so the controller's energy model learns it did not get what it
-asked for. `ForcedFull` is bit 1 of the ack's flags byte.
+produces a smeared digit. `usslp_waveform_lut` returns no partial LUT in that
+band, and `usslp_eink_refresh` falls back to a full refresh locally. It does
+**not** report `ForcedFull`: the plan it is handed is `const`, so the ack still
+carries the plan the policy made — bit 0 set, bit 1 clear. `ForcedFull`, bit 1
+of the ack's flags byte, is set only by the two cases `planRefresh` itself
+decides — a colour panel, and the partial counter at its limit — which is where
+the controller's energy model does learn it did not get what it asked for.
 
 ```mermaid
 flowchart TB
@@ -90,12 +94,16 @@ flowchart TB
   B -- no --> F["Full waveform requested"]
   B -- yes --> P["Partial offered"]
   P --> C["SEC renders, diffs framebuffer,<br/>computes partial region"]
-  C --> L{"Label: planRefresh<br/>own partial counter,<br/>panel tier, temperature"}
+  C --> L{"Label: planRefresh<br/>own partial counter,<br/>panel tier"}
   F --> C
-  L -- "colour panel, or counter at limit,<br/>or below -10 C" --> FF["Full waveform, 1500-15000 ms"]
-  L -- otherwise --> PP["Partial waveform, 300 ms"]
+  L -- "colour panel, or counter at limit" --> FF["Full waveform, 1500-15000 ms"]
+  L -- otherwise --> PP["Partial planned, 300 ms"]
   FF --> ACK["Ack: flags bit 1 ForcedFull"]
-  PP --> ACK2["Ack: flags bit 0 partial ran"]
+  PP --> D{"Driver: below -10 C?<br/>no partial LUT in the freezer band"}
+  D -- yes --> DF["Full waveform, run locally"]
+  D -- no --> DP["Partial waveform, 300 ms"]
+  DF --> ACK3["Ack still reports the plan:<br/>bit 0 set, bit 1 clear"]
+  DP --> ACK2["Ack: flags bit 0 partial ran"]
 ```
 
 ### The colour panel cannot do this at all

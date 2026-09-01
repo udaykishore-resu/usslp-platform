@@ -77,6 +77,40 @@ Under node pressure the kubelet evicts by priority. Losing a price-path pod stop
 prices reaching shelves, which is regulatory exposure; an hour of missing
 analytics is a reporting gap recovered by replaying the stream.
 
+The same table read as a picture, next to the thing it depends on: almost
+nothing in this platform is shared between regions, so an eviction decision is
+always a decision inside one region.
+
+```mermaid
+flowchart TB
+  subgraph GLOBAL["Global - exactly one of each"]
+    GIT["github.com/usslp/usslp"]
+    REGY["GHCR - images and oci charts/usslp"]
+    ARGO["One ApplicationSet and one AppProject in namespace<br/>argocd, 5 destinations: dev in-cluster, staging-use1,<br/>and the three prod clusters"]
+  end
+  subgraph REGIONS["Three regions - same Terraform composition, different variables"]
+    USE1["us-east-1, primary. prod-use1 and staging-use1.<br/>dataResidency.enforced false - the default home for<br/>tenants with no residency requirement"]
+    EUW1["eu-west-1. dataResidency.enforced,<br/>tenant classes eu, eea, uk"]
+    APS1["ap-south-1. dataResidency.enforced, class in.<br/>Three AZs and no more, so zone maxSkew 1 puts two<br/>of a six-pod floor in each"]
+  end
+  subgraph PERREGION["Regional and never shared"]
+    DATA["EKS, MSK 6 brokers in KRaft, Aurora, ElastiCache,<br/>S3 firmware with Object Lock in COMPLIANCE mode"]
+    KEYS["4 KMS keys, one per data domain, multi_region false,<br/>each with a Deny on aws:RequestedRegion"]
+    STORE["Region-local ClusterSecretStore in the two residency<br/>regions, and region-local Terraform state"]
+    NOPEER["No VPC peering and no transit gateway anywhere.<br/>The data subnet tier has no default route at all"]
+  end
+  subgraph SHED["In every cluster - preemptionPolicy PreemptLowerPriority"]
+    P100["usslp-analytics 100000<br/>analytics-service"]
+    P500["usslp-platform 500000<br/>device-registry, ota-service,<br/>promotion-service, kafka-connect"]
+    P1M["usslp-price-path 1000000<br/>api-gateway, pos-integration-gw, label-service,<br/>pricing-ai-service, mqtt-broker"]
+    P100 -->|"evicted first - an hour of backlog<br/>is replayed from the stream"| P500
+    P500 -->|"then, and only then"| P1M
+  end
+  GLOBAL --> REGIONS
+  REGIONS --> PERREGION
+  REGIONS --> SHED
+```
+
 ### Spread, and one non-obvious choice
 
 Zone and node topology-spread constraints are both `ScheduleAnyway`, never
@@ -98,20 +132,49 @@ one silently matches nothing.
 
 ## 2. GitOps flow
 
+Two workflows and one controller. Nothing here deploys: the release makes a
+signed artifact available, and a human decides when a region takes it.
+
 ```mermaid
-flowchart LR
-  DEV["Commit / PR"] --> CI["CI: deploy-verify, go-checks,<br/>go test -race, govulncheck, CodeQL,<br/>image build"]
-  CI --> TAG["release-* tag"]
-  TAG --> REL["Release: verify, build,<br/>push to GHCR, cosign sign,<br/>SBOM attestation, provenance,<br/>publish and sign the chart"]
-  REL --> GIT["Git: chart version + image digest"]
-  GIT --> AS["ArgoCD ApplicationSet<br/>one Application per region x environment"]
-  AS --> DEVC["dev - auto-sync on"]
-  AS --> STG["staging - auto-sync on"]
-  AS --> PRD["prod - auto-sync OFF,<br/>tracks release-* tags"]
-  PRD --> ROLL["Argo Rollouts canary<br/>on the three price-path services"]
-  ROLL --> ANA["Prometheus analysis<br/>at 5% and 25%"]
-  ANA -->|pass| FULL["100%"]
-  ANA -->|fail| ABORT["Abort: 100% back to stable"]
+flowchart TB
+  PR["Commit or PR to main"]
+  DV["CI deploy-verify: yaml-check, helm-lint,<br/>verify-rules, verify-metrics, verify-topics,<br/>tf-check, shell-check"]
+  GO["CI go-checks: fmt, vet, build,<br/>go test -race, govulncheck, CodeQL"]
+  IMG["CI images, 11 command dirs - build, assert the image<br/>is 65532:65532 and shell-free, Trivy blocking on a<br/>fixable CRITICAL, SBOM"]
+  POL["CI policy - kyverno apply against the<br/>rendered values-prod-use1 manifests"]
+  TAG["Tag v*.*.* or release-*"]
+  VER["Release verify - re-runs every CI check on the tag,<br/>because a tag can point at a commit that never<br/>had a green run"]
+  PUSH["Build and push to GHCR, linux/amd64 and linux/arm64,<br/>provenance mode=max, sbom true"]
+  SIGN["cosign sign the digest, keyless.<br/>A tag can be moved after signing, a digest cannot"]
+  ATT["cosign attest the SBOM as spdxjson, plus<br/>attest-build-provenance with push-to-registry"]
+  SELF["cosign verify the signature just made, against the<br/>same identity Kyverno checks"]
+  CHART["helm package, push to oci charts/usslp,<br/>cosign sign the chart"]
+  EDGE["edge-artifacts per arch - usslp-sgu, usslp-sec,<br/>usslp-labelsim, SHA-256 sums, manifest.json, all<br/>cosign sign-blob. Read by deploy/edge/update.sh"]
+  AS["ApplicationSet, list generator -<br/>5 Applications, not a 3 by 3 matrix"]
+  DEVC["dev, region local, revision main"]
+  STG["staging-use1, revision main"]
+  PRD["prod-use1, prod-euw1, prod-aps1 -<br/>element autoSync false, revision release-*"]
+  ADM["Admission - Kyverno verifyImages with mutateDigest,<br/>registry allow-list, no mutable tag"]
+  ROLL["Argo Rollouts canary on api-gateway,<br/>pos-integration-gw and label-service"]
+
+  PR --> DV
+  PR --> GO
+  DV --> IMG
+  DV --> POL
+  PR -->|"merge, then tag"| TAG
+  TAG --> VER
+  VER --> PUSH
+  PUSH --> SIGN
+  SIGN --> ATT
+  ATT --> SELF
+  SELF --> CHART
+  VER --> EDGE
+  CHART --> AS
+  AS --> DEVC
+  AS --> STG
+  AS --> PRD
+  PRD --> ADM
+  ADM --> ROLL
 ```
 
 **The ApplicationSet uses an explicit list, not a matrix.** A 3×3 matrix would
@@ -197,6 +260,43 @@ behaviour is to **pass**. A canary gated on a typo is a canary with no gate and
 looks identical to a working one on the dashboard — which is why
 `verify-metrics.py` checks the analysis queries too.
 
+The steps and the gates in one place, because the gates are the part that is
+easy to get wrong and impossible to see on a dashboard.
+
+```mermaid
+flowchart TB
+  START["Sync the Rollout. workloadRef points at the Helm<br/>Deployment with scaleDown onsuccess, so the Rollout<br/>owns only the strategy"]
+  BG["Background analysis for the whole rollout -<br/>usslp-process-health, plus usslp-consumer-lag on<br/>label-service. It catches the regression that<br/>appears after ten minutes"]
+  W5["setWeight 5, rewriting the weights on the named Istio<br/>routes only. api-gateway shifts proxy and never<br/>stream, which carries live WebSockets"]
+  P2["pause 2m"]
+  A1{"analysis at 5 percent"}
+  W25["setWeight 25"]
+  P3["pause 3m"]
+  A2{"analysis at 25 percent"}
+  W100["setWeight 100"]
+  ABORT["Abort - 100 percent back to stable at once. The canary<br/>pods are held 1800s so the failing state is available.<br/>progressDeadlineSeconds 900 with progressDeadlineAbort<br/>aborts rather than pausing forever"]
+  subgraph TPL["What each analysis runs, every query filtered on version=canary-version"]
+    T1["usslp-success-rate - interval 1m, count 5,<br/>failureLimit 2, ok at 0.995 or better"]
+    T2["usslp-request-latency - p99 at or under 0.4 for<br/>label-service, 0.25 for api-gateway"]
+    T3["usslp-price-path-latency, label-service only -<br/>e2e within 3s at 0.99 or better, attestation increase<br/>exactly 0 with failureLimit 0, confirmations 0.98"]
+    T4["usslp-pos-ingest-latency, uig only - p95 at or under<br/>0.25, budget breaches under 0.01,<br/>publish failures exactly 0"]
+    T5["usslp-gateway-health, api-gateway only - open breakers<br/>exactly 0, panics exactly 0 with failureLimit 0,<br/>upstream failures under 0.01"]
+  end
+  START --> BG
+  START --> W5
+  W5 --> P2
+  P2 --> A1
+  A1 -->|"pass"| W25
+  W25 --> P3
+  P3 --> A2
+  A2 -->|"pass"| W100
+  A1 -->|"fail, or failOnInconclusive on no data"| ABORT
+  A2 -->|"fail"| ABORT
+  BG -->|"fail"| ABORT
+  A1 --- TPL
+  A2 --- TPL
+```
+
 `pricing-ai-service` is on the price path and deliberately does **not** get a
 Rollout: the Label Service falls back when a pricing decision does not arrive
 inside its budget, so a bad pricing canary degrades optimisation rather than
@@ -261,6 +361,52 @@ A different mechanism again — see
 downloads per controller, inside the store's local quiet hours. A fleet update is
 measured in days, and firmware is the one thing on this platform that **cannot be
 rolled back over the air**: a device that does not boot needs a person.
+
+Two mechanisms that look similar and share nothing. The gateway's updater is a
+shell script and a timer; the label's is a controller with four health gates and
+no way back.
+
+```mermaid
+flowchart TB
+  subgraph BIN["Gateway and controller binaries - deploy/edge"]
+    TMR["usslp-update.timer - 02:00 local,<br/>RandomizedDelaySec 4h, FixedRandomDelay so a store's<br/>slot is stable, Persistent, AccuracySec 1h"]
+    MAN["update.sh takes USSLP_TARGET_VERSION, or the version<br/>field of the manifest at USSLP_UPDATE_MANIFEST_URL.<br/>Clearing that pin stops every store that has not checked"]
+    AUTO{"is the store autonomous?<br/>sgu_store_mode is 1"}
+    SKIP["Skipped. Restarting now takes down the only thing<br/>pricing this store and flushes the upstream queue<br/>mid-write. Retried at the next slot"]
+    DL["Download, then SHA-256 against the published digest"]
+    MIS["Mismatch - refuse, including with --force.<br/>Corrupt or hostile, and there is no third option"]
+    INST["Install beside the others under<br/>/usr/local/lib/usslp/version, swap current atomically"]
+    RST["Restart usslp-sgu.service, then usslp-sec@ instances,<br/>poll /readyz for USSLP_READY_TIMEOUT"]
+    OK["Ready. Prune to the last three versions"]
+    RB["Not ready - swap back and restart. The old version is<br/>still on disk, so the rollback needs no network"]
+  end
+  subgraph FW["Label firmware - ADR 0016"]
+    UP["Upload. Unsigned artifacts are refused here, not at<br/>rollout. The signature covers version, hardware tier<br/>and digest, so an image cannot be re-declared as<br/>another tier"]
+    C["Cohorts 1, 5, 25, 100 percent, cumulative.<br/>Membership is sha256 of jobID and deviceID mod 10000 -<br/>a pure function, nothing stored, nothing to drift"]
+    DISP["Dispatch inside the store's local quiet hours,<br/>4 concurrent downloads per controller"]
+    GATE{"health gates, in diagnostic order"}
+    WAIT["Wait - fewer than 20 outcomes, or not every dispatched<br/>device has reported, or soaking through 30 minutes"]
+    NEXT["Advance to the next cohort"]
+    HALT["Halt or roll back. There is no halted to running edge,<br/>and a flashed image is not recoverable over the air"]
+  end
+  TMR --> MAN
+  MAN --> AUTO
+  AUTO -->|"yes"| SKIP
+  AUTO -->|"no"| DL
+  DL -->|"mismatch"| MIS
+  DL -->|"match"| INST
+  INST --> RST
+  RST -->|"/readyz answers"| OK
+  RST -->|"timeout"| RB
+  UP --> C
+  C --> DISP
+  DISP --> GATE
+  GATE -->|"not enough evidence yet"| WAIT
+  WAIT --> DISP
+  GATE -->|"pass"| NEXT
+  NEXT --> DISP
+  GATE -->|"boot failures above 1 percent, then silence above 5,<br/>then battery anomaly above 5, then error rate above 2"| HALT
+```
 
 ---
 

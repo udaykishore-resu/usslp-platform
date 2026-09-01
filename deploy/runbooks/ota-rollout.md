@@ -13,6 +13,52 @@ them by hand.
 
 **So: pause the rollout first, diagnose second.** Always.
 
+Everything below in the order it must happen. The first box is not a triage
+step; it is the one action that is cheap to take and expensive to skip.
+
+```mermaid
+flowchart TB
+  A["USSLPOTAErrorBudgetBurnFast, USSLPOTARollbackTriggered<br/>or USSLPOTAArtifactsRejected"]
+  P["PAUSE FIRST - POST /v1/ota/jobs/ID/pause.<br/>Pausing costs a delay. Not pausing costs a fleet, and a<br/>bricked label is recovered by somebody driving there"]
+  Q{"sum by status of the 15m rate of<br/>ota_device_outcomes_total"}
+  R{"which terminal status dominates?"}
+  R1["failed - download or flash failed. The device is still<br/>on its old firmware and can be retried. Recoverable"]
+  R2["boot_failed - flashed, would not boot, fell back to the<br/>previous image. The image is bad"]
+  R3["silent - dispatched and never heard from again.<br/>The worst case, possibly bricked. A rising count<br/>justifies escalating beyond this runbook"]
+  R4["rolled_back - the controller reverted by itself.<br/>The mechanism worked, and a human must still know:<br/>a firmware reached real devices and failed on them"]
+  S["Nothing failing, but dispatch has stopped - sum by<br/>reason of the 15m rate of ota_dispatch_suppressed_total"]
+  S1["quiet hours - working as designed.<br/>The rollout resumes on its own"]
+  S2["battery holds - deliberate. Flashing a label at<br/>8 percent battery is how a label becomes silent"]
+  S3["concurrency cap - USSLP_OTA_MAX_CONCURRENT_PER_SEC.<br/>A mesh carrying 8 firmware downloads is a mesh not<br/>carrying price updates"]
+  U["Uploads refused - sum by reason of the 1h increase of<br/>ota_artifacts_rejected_total"]
+  U1["If the reason is signing - with USSLP_OTA_SIGNING_KEYS<br/>unset the service starts normally and refuses every<br/>upload, logging it once at boot and nowhere else.<br/>A failed ExternalSecret reconcile produces exactly this"]
+  Y["Revert the devices that took it with<br/>/v1/ota/jobs/ID/rollback, or stop the job for good with<br/>/abort. The dispatched S3 object version is recorded,<br/>so a rollback fetches that exact version"]
+  V{"is the cause understood AND<br/>has the artifact changed?"}
+  W["Resume deliberately, with a smaller first cohort.<br/>The cohort machinery exists for exactly this"]
+  X["Do not resume. Do not retry a boot_failed cohort with<br/>the same image - it will boot-fail again. Do not raise<br/>the failure threshold. Do not dispatch during trading<br/>hours to catch up"]
+  A --> P
+  P --> Q
+  Q -->|"devices are failing"| R
+  R --> R1
+  R --> R2
+  R --> R3
+  R --> R4
+  Q -->|"no failures, no dispatch"| S
+  S --> S1
+  S --> S2
+  S --> S3
+  Q -->|"artifacts refused at upload"| U
+  U --> U1
+  R2 --> Y
+  R3 --> Y
+  R1 --> V
+  R4 --> V
+  Y --> V
+  U1 --> V
+  V -->|"yes"| W
+  V -->|"no"| X
+```
+
 ---
 
 ## Pause it

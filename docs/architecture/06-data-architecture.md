@@ -48,19 +48,17 @@ flowchart LR
     pos["POS and ERP"] --> uig["UIG"]
     uig --> s_price["price-updates"]
     uig --> s_pos["pos-integration"]
-    uig --> s_inv["inventory-sync"]
+    uig -.->|"provisioned; no producer"| s_inv["inventory-sync"]
 
     s_price --> ls["Label Service"]
     s_price --> pr["Pricing"]
     s_price --> an["Analytics"]
-    s_inv --> pr
-    s_inv --> an
-    s_pos --> an
+    s_pos -.->|"no consumer; replay and triage only"| triage
 
     reg["Device Registry"] --> s_dev["device-events"]
     reg --> s_tel["label-telemetry"]
     s_dev --> ls
-    s_dev --> ota["OTA"]
+    ota["OTA"]
     s_tel --> an
 
     ls --> s_del["label-delivery"]
@@ -73,12 +71,9 @@ flowchart LR
     s_promo --> ls
 
     ota --> s_ota["ota-commands"]
-    s_ota --> reg
 
     ls --> s_audit["audit-log"]
-    uig --> s_audit
-    reg --> s_audit
-    s_audit --> siem["Compliance and SIEM"]
+    s_audit -.->|"no consumer in tree"| siem["Compliance and SIEM"]
 
     ls -.->|"poison records"| s_dlq["dead-letter"]
     s_dlq --> triage["Human triage"]
@@ -146,17 +141,17 @@ flowchart TB
         sched[("Schedule due-index<br/>ordered by effective time")]
         col[("Columnar analytics store")]
         es --> proj
-        proj --> dir
         proj --> lstate
-        proj --> sched
     end
 
     subgraph pub["Publication"]
         streams["Event streams"]
         es --> streams
         streams --> col
-        streams --> dir
+        streams -->|"device-events, from offset 0"| dir
     end
+
+    agg -->|"syncSchedules, diffed per command"| sched
 
     api["Queries: HTTP, console, reports"] --> dir
     api --> lstate
@@ -206,7 +201,8 @@ still building.
 | Aggregate | Stream id | Events |
 |---|---|---|
 | **Label** (`label/domain`) | `label/{labelID}` | `device.label.provisioned`, `device.label.assigned`, `label.price.updated`, `label.price.scheduled`, `label.price.schedule_cancelled`, `label.price.rejected`, `label.update.delivered`, `label.update.failed`, `device.status.offline`, `device.status.online`, `device.label.retired` |
-| **Device** (`registry/domain`) | `device/{deviceID}` | `device.label.provisioned` / `device.sec.provisioned` / `device.sgu.provisioned`, `device.label.assigned`, `device.label.unassigned`, `device.state.changed`, `device.security.quarantined`, `device.lifecycle.retired`, `device.battery.critical`, `planogram.updated` |
+| **Device** (`registry/domain`) | `device/{deviceID}` | `device.label.provisioned` / `device.sec.provisioned` / `device.sgu.provisioned`, `device.label.assigned`, `device.label.unassigned`, `device.state.changed`, `device.security.quarantined`, `device.lifecycle.retired`, `device.battery.critical`, `mesh.link.degraded` |
+| **Planogram** (`registry/domain`) | `planogram/{storeID}` | `planogram.updated` |
 | **OTA job** (`ota/domain`) | `ota-job/{jobID}` | `ota.job.created`, `ota.job.state.changed`, `ota.device.dispatched`, `ota.device.updated`, `ota.cohort.advanced`, `ota.rollback.triggered` |
 
 Three event names are internal to the Label aggregate and deliberately not in
@@ -439,7 +435,6 @@ erDiagram
     TENANT ||--o{ BINDING : configures
     TENANT ||--o{ PROMOTION : authors
     TENANT ||--o{ OTA_JOB : runs
-    TENANT ||--|| PRICE_AUTHORITY : owns
 
     STORE ||--|| SGU : has
     STORE ||--o{ SEC : contains
@@ -483,7 +478,7 @@ erDiagram
         string sku FK
         string eui64
         string serial
-        string display_tier
+        string hardware_tier
         string state
         int64 sequence
         int64 base_price_minor
@@ -544,12 +539,14 @@ erDiagram
     PROMOTION {
         string promotion_id PK
         string type
+        string exclusive_group
         int priority
         bool stackable
         string state
     }
     OTA_JOB {
         string job_id PK
+        string hardware_tier
         string from_version
         string to_version
         string artifact_id
@@ -569,7 +566,11 @@ erDiagram
         string delivery_id PK
         string binding_id FK
         string status
-        string body_sha256
+        int body_size
+        string reason
+        int emitted
+        string replay_of
+        int replay_count
     }
     SGU {
         string sgu_id PK
@@ -581,12 +582,18 @@ erDiagram
         timestamp updated_at
     }
     SHELF_POSITION {
-        string position_id PK
+        string shelf PK
+        string rail PK
+        int position PK
         string sku FK
+        string sec_id FK
+        int facings
     }
     PRICE_AUTHORITY {
         string key_id PK
         string algorithm
+        int retained_keys
+        duration rotation_overlap
     }
 ```
 
@@ -623,8 +630,8 @@ stateDiagram-v2
     active --> offline : LabelWentOffline
     offline --> active : LabelCameOnline or DeliveryConfirmed
     offline --> assigned : LabelCameOnline with no price ever shown
-    active --> assigned : LabelAssigned to a different SKU
-    offline --> assigned : LabelAssigned to a different SKU
+    active --> assigned : LabelAssigned
+    offline --> assigned : LabelAssigned
     active --> retired : LabelRetired
     offline --> retired : LabelRetired
     assigned --> retired : LabelRetired
@@ -635,10 +642,12 @@ stateDiagram-v2
         Only the ability to change it is lost.
     end note
     note right of assigned
-        Reassignment clears the previous price
+        Any reassignment clears the previous price
         and the pending update, so the guard rail
         does not compare a new product's price
-        against an old product's.
+        against an old product's. A reassignment to a
+        different SKU also clears base price,
+        category and brand.
     end note
 ```
 

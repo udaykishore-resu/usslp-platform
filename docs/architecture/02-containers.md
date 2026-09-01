@@ -56,7 +56,7 @@ flowchart TB
     apigw --> analytics
     apigw --> uig
 
-    uig -->|"price-updates,<br/>pos-integration,<br/>inventory-sync"| streams
+    uig -->|"price-updates,<br/>pos-integration"| streams
     streams -->|"price-updates,<br/>device-events, label-delivery,<br/>promotion-events"| labelsvc
     streams --> pricing
     streams --> analytics
@@ -64,6 +64,7 @@ flowchart TB
     ota --> streams
     promo --> streams
     labelsvc --> streams
+    streams -->|"price-updates, label-delivery,<br/>device-events, promotion-events,<br/>ota-commands — console feed"| apigw
 
     labelsvc --> es
     labelsvc --> rm
@@ -71,11 +72,14 @@ flowchart TB
     registry --> rm
     ota --> art
     analytics --> col
+    pricing --> rm
+    promo --> rm
 
     labelsvc -->|"QoS 1 retained price"| cloudmqtt
     registry -->|"retained config"| cloudmqtt
     ota -->|"QoS 2 trigger"| cloudmqtt
     labelsvc -->|"ACK subscription"| cloudmqtt
+    cloudmqtt -->|"telemetry, mesh and heartbeat<br/>FilterAll subscriptions"| registry
     pki_c --> labelsvc
     pki_c --> registry
     pki_c --> apigw

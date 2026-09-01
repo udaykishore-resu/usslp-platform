@@ -91,6 +91,11 @@ boundaries — is [`docs/architecture/INTERFACE-CONTRACTS.md`](docs/architecture
 It is enforced by code in `platform/pkg/canon` and checked against the runtime
 by `TestLatencyBudgetMatchesTheContract`.
 
+Every diagram in the repository — 84 of them, covering the context, the
+components, the boards, the sequences with their latency budgets, the state
+machines and the runbook decision trees — is indexed by kind in
+[`docs/architecture/DIAGRAMS.md`](docs/architecture/DIAGRAMS.md).
+
 † **The blueprint estate figures do not multiply, and this README repeats them
 rather than quietly picking one.** "One controller per ~8 m of shelving" cannot
 hold at the same time as "~25 controllers and up to 40,000 labels" in one store

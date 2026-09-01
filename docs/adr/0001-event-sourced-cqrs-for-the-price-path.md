@@ -74,8 +74,8 @@ flowchart LR
   LST --> PROJ
   ES --> AUD["audit-log<br/>365-day retention"]
 
-  SEC["Shelf Edge Controller"] --> TEL["label-telemetry<br/>2048 partitions, 72h"]
-  TEL --> REG["Device Registry<br/>health read model"]
+  SEC["Shelf Edge Controller"] -->|"batched telemetry over MQTT"| REG["Device Registry<br/>health read model"]
+  REG --> TEL["label-telemetry<br/>2048 partitions, 72h"]
   TEL --> AN["Analytics columnar store"]
 ```
 

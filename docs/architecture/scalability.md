@@ -57,6 +57,50 @@ rates are both derivable.
 
 ## 2. The capacity model, derived
 
+Every number in this section descends from one estate figure through one of two
+rates. The chain is short enough to draw, which is the point: change the estate
+and everything below it moves, and the two places where an unstated assumption
+enters are the two places worth arguing about.
+
+```mermaid
+flowchart TB
+  ESTATE["The estate<br/>50,000,000 labels across 100,000 stores<br/>500 labels per store on average"]
+  INCONS["Recorded and unresolved - 100,000 stores of<br/>40,000 labels is 4 billion, eighty times the<br/>50 million estate. The 13 million per second in<br/>registry telemetry is a worst-case store applied<br/>to every store, not the estate"]
+
+  CAD["Cadence - 1 telemetry report<br/>per label per 5 minutes"]
+  TELE["167,000 readings per second<br/>50,000,000 divided by 300"]
+
+  CHG["Workload - 10 price changes<br/>per label per day"]
+  MEAN["5,787 changes per second at the mean<br/>500,000,000 divided by 86,400"]
+  A1["Assumption, nowhere in the code -<br/>the busiest hour carries 37.5 percent of the day,<br/>a peak-to-mean ratio of 9"]
+  PEAK["52,000 price updates per second at peak"]
+
+  PART["Partitions - 2048 telemetry, 1024 price;<br/>catalogue total 5,472"]
+  REPL["16,416 partition replicas at RF 3,<br/>2,736 per broker across 6, against MSK's 4,000"]
+
+  SIZE["Measured against canon.Envelope -<br/>envelope 1,196 B, telemetry payload 328 B"]
+  A2["Assumptions - producers reach zstd 3 to 1,<br/>and audit-log keeps 7 days on the broker, not 365"]
+  STOR["Storage - about 51.5 TB plus 35 percent headroom,<br/>so 70 TB, provisioned as 6 x 12,000 GB"]
+
+  CONN["Connections - 100,000 gateway sessions<br/>to the cloud; 2.5 M controller sessions<br/>stay on 100,000 store LANs"]
+  BW["Bandwidth - about 10 kbit/s per store<br/>in each direction at steady state"]
+
+  ESTATE --- INCONS
+  ESTATE --> CAD --> TELE
+  ESTATE --> CHG --> MEAN --> PEAK
+  A1 --> PEAK
+  TELE --> PART
+  PEAK --> PART
+  PART --> REPL
+  TELE --> STOR
+  PEAK --> STOR
+  SIZE --> STOR
+  A2 --> STOR
+  ESTATE --> CONN
+  PEAK --> BW
+  SIZE --> BW
+```
+
 ### 2.1 Telemetry: 167,000 events per second
 
 This one is exact and it needs no assumptions beyond the cadence.
@@ -124,6 +168,36 @@ rule.
 Partitions bound consumer parallelism: a group can have at most one member per
 partition, and partition count cannot be changed later without breaking key
 affinity (`pkg/eventlog` refuses it outright with `ErrPartitionsChanged`).
+
+The count in the table below is squeezed from three directions, and the key is
+chosen before any of them. The choice that matters most is at the top: ordering
+is a property of a key, so the partition count buys parallelism across keys and
+nothing at all within one.
+
+```mermaid
+flowchart TB
+  KEY["Choose the key first -<br/>label-telemetry by label,<br/>price-updates by store:sku,<br/>audit-log by tenant"]
+  ORD["Ordering holds within one key only.<br/>One key lands on one partition, one partition has<br/>one consumer, and the price path runs<br/>ConsumerConcurrency 1"]
+  CONS["Consequence - a hot store:sku is not helped by any<br/>partition count. Throughput per key is what CP<br/>ordering costs, and it is the bound"]
+
+  RATE["Stream rate -<br/>167,000 per second telemetry,<br/>52,000 per second price at peak"]
+  LOW["Lower bound - enough partitions to keep records per<br/>second per partition modest. 2048 gives 82 per<br/>second, 1024 gives 51"]
+  CARD["Where key cardinality is low the key binds, not the<br/>rate. audit-log is 64 partitions because it is keyed<br/>by tenant, despite the highest volume"]
+
+  TOT["Catalogue total 5,472 partitions"]
+  UP["Upper bound - 5,472 x RF 3 is 16,416 replicas,<br/>2,736 per broker across 6. The Terraform<br/>precondition fails the plan above 3,500"]
+  CEIL["MSK's documented ceiling -<br/>4,000 partitions per broker"]
+  FIX["Fixed for the life of the stream.<br/>pkg/eventlog refuses a redefinition<br/>with ErrPartitionsChanged"]
+
+  KEY --> ORD --> CONS
+  KEY --> CARD
+  RATE --> LOW
+  LOW --> TOT
+  CARD --> TOT
+  TOT --> UP
+  CEIL --> UP
+  UP --> FIX
+```
 
 | Stream | Partitions | Rate | Records/s/partition | Retention |
 |---|---:|---:|---:|---:|
@@ -247,6 +321,45 @@ broker. They are 100,000 independent populations of ~25, each on a LAN, none of
 which the cloud ever sees. **The cloud's MQTT fan-out is 100,000 connections, not
 2.6 million** — and at the chart's fixed 5 `mqtt-broker` replicas that is 20,000
 sessions per broker.
+
+Connection counts are one view of a more general fact: the cloud tier scales on
+replicas, the store tier scales by existing 100,000 times over, and two things
+in the middle are deliberately fixed. The multipliers on the arrows are what
+turn one into the other.
+
+```mermaid
+flowchart TB
+  subgraph HZ["Scales horizontally - HPA on, replicas min to max"]
+    APIGW["api-gateway 6 to 40"]
+    LSV["label-service 6 to 30"]
+    UIGW["pos-integration-gw 4 to 20"]
+    REG["device-registry 3 to 10"]
+    OTH["pricing-ai 3 to 12, promotion 2 to 10,<br/>ota 2 to 6, analytics 2 to 8,<br/>kafka-connect 3 to 8"]
+  end
+
+  subgraph FX["Fixed by design"]
+    BRK["mqtt-broker - 5 replicas, HPA disabled.<br/>EMQX rebalances sessions on a membership change"]
+    MSK["Kafka - 6 brokers, 5,472 partitions.<br/>Partition count cannot be changed later"]
+  end
+
+  subgraph PS["Per store - one such population, times 100,000"]
+    SGU["1 Store Gateway Unit,<br/>1 TLS session to the cloud"]
+    SBRK["1 store MQTT broker,<br/>never reachable from the cloud"]
+    SEC["about 25 Shelf Edge Controllers"]
+    LBL["500 labels on average,<br/>up to 40,000 in the largest store"]
+  end
+
+  APIGW --> LSV
+  UIGW --> LSV
+  LSV --> MSK
+  REG --> MSK
+  MSK --> BRK
+  BRK -- "100,000 sessions, 20,000 per replica" --> SGU
+  SGU --> SBRK
+  SBRK -- "about 25 LAN connections per store, 2.5 M in total,<br/>none of which the cloud sees" --> SEC
+  SEC -- "downstream fan-out, bounded at 8 concurrent<br/>transmissions per controller" --> LBL
+  LBL -- "telemetry batched per controller -<br/>500 readings become 25 messages, 20-fold" --> SEC
+```
 
 The broker HPA is **disabled by default** and the values file explains why: EMQX
 rebalances sessions on a membership change, and an autoscaler that adds and
@@ -389,6 +502,51 @@ Per-controller channel utilisation: 1.91% – 2.20%. Queue depth and in-flight b
 | Stores | 100,000 | **2** | 50,000× |
 | Controllers | 2,500,000 | **8** | 312,000× |
 | Machine | a multi-region Kubernetes estate | **one 2-core container** | — |
+
+The ratios above are large enough to be hard to hold in the head at once. What
+the shape below adds is the direction of the arrows: what each measured figure
+does and does not license anyone to claim.
+
+```mermaid
+flowchart TB
+  subgraph MOD["Modelled - section 2"]
+    M1["52,000 price updates per second at peak"]
+    M2["50,000,000 labels in 100,000 stores"]
+    M3["2,500,000 Shelf Edge Controllers"]
+    M4["Multi-region Kubernetes estate,<br/>MSK at 1,024 partitions"]
+  end
+
+  subgraph MEA["Measured - section 3"]
+    S1["37.7 per second sustained end to end"]
+    S2["480 labels in 2 stores"]
+    S3["8 controllers"]
+    S4["One 2-core container,<br/>in-process pkg/eventlog"]
+  end
+
+  M1 -- "about 1,380 times" --> S1
+  M2 -- "about 104,000 times" --> S2
+  M3 -- "about 312,000 times" --> S3
+  M4 -- "no Kafka adapter exists in the tree" --> S4
+
+  subgraph NOT["Not established by any measurement here"]
+    N1["Cloud-tier throughput - the ceiling found is the<br/>simulator's edge tier, by its own admission"]
+    N2["Kafka at 1,024 partitions"]
+    N3["Real radio - every airtime, waveform and battery<br/>figure is a model or a datasheet number"]
+  end
+
+  subgraph HELD["What did hold, repeatably"]
+    H1["p99 across four thousand-change runs -<br/>2,420, 1,890 and 2,441 ms in the README runs,<br/>2,365 ms here"]
+    H2["The platform's own clock agrees with a stopwatch<br/>outside the process to within 17 ms"]
+    H3["The radio hop exceeds its contract line item<br/>repeatably - p99 314 to 343 ms against 300 ms"]
+  end
+
+  S4 --> N1
+  S4 --> N2
+  S3 --> N3
+  S1 --> H1
+  S1 --> H2
+  S3 --> H3
+```
 
 **Nothing in this repository has been run at or near the capacity model.** What
 has been demonstrated is that the price path is correct, that its latency is

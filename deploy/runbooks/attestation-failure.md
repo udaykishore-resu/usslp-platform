@@ -37,6 +37,48 @@ sum by (sec, reason) (increase(sec_compliance_alerts_total[1h]))   # edge: canno
 
 They are different incidents with different responses.
 
+The whole runbook in one view. The branch that matters is the last one, and
+taking it the wrong way authorises whatever produced the bad signature.
+
+```mermaid
+flowchart TB
+  A["USSLPAttestationFailure or<br/>USSLPControllerComplianceRefusal"]
+  B{"which side failed? compare the 1h increase of<br/>usslp_attestation_failures_total and<br/>sec_compliance_alerts_total"}
+  C["Cloud - the Label Service could not SIGN. Nothing was<br/>published, every affected label keeps its previous price.<br/>A full stop on the price path, not a degradation"]
+  D{"reason label"}
+  D1["key material unreadable - the ExternalSecret<br/>usslp-label-service-price-authority did not reconcile,<br/>or the projected file's mode is wrong"]
+  D2["key expired - the key ceremony.<br/>Not something to work around"]
+  D3["tenant has no key - a tenant was onboarded without a<br/>price-authority key. Issue it"]
+  E["Edge - a controller could not VERIFY. The update was<br/>dropped and the previous price stays on the glass"]
+  F{"shape of the refusals"}
+  G["Fleet-wide or store-wide, starting shortly after a key<br/>rotation, reason names an unknown key id"]
+  H["Isolated to one store or one controller,<br/>no recent rotation"]
+  L["Fleet-wide with an unknown key id while the cloud<br/>reports nothing wrong at all - the ephemeral-key trap.<br/>USSLP_PRICE_AUTHORITY_DIR is unset and label-service<br/>minted its own key at boot. Grep the boot log"]
+  I["a - a key-ring sync fault. Push the current key ring,<br/>restart the affected controllers, confirm prices flow.<br/>A controller restart is safe - it rebuilds its zone from<br/>the retained messages on the store's broker"]
+  J["b - a signature that genuinely does not verify.<br/>A security incident. Leave the controller running, it is<br/>refusing correctly. Capture the journal, its /metrics<br/>and the broker state, then escalate"]
+  K["Do NOT push a new key ring - it authorises whatever<br/>produced the bad signature. Do NOT restart the store<br/>gateway - its retained messages are the evidence,<br/>alongside the audit-log stream's 365 days"]
+  M["Recovery - both increases 0 over 10m AND the applied<br/>rate of usslp_price_updates_total non-zero. Failures<br/>stopping because prices stopped being attempted<br/>is not recovery"]
+  A --> B
+  B -->|"cloud"| C
+  C --> D
+  D --> D1
+  D --> D2
+  D --> D3
+  B -->|"edge"| E
+  E --> F
+  F -->|"after a rotation"| G
+  F -->|"isolated, no rotation"| H
+  F -->|"cloud is silent"| L
+  G --> I
+  H --> J
+  J --> K
+  D1 --> M
+  D2 --> M
+  D3 --> M
+  I --> M
+  L --> M
+```
+
 ---
 
 ## Cloud side — `usslp_attestation_failures_total`

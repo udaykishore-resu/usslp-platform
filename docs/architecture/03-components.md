@@ -215,8 +215,8 @@ authority and rebuilds the same row from the same function.
 ```mermaid
 flowchart TB
     subgraph transports["Transports — gateway/gateway.go"]
-        webhook["POST /v1/ingest/{tenant}/pos<br/>body capped at 8 MiB"]
-        soap["Oracle RIB SOAP endpoint"]
+        webhook["POST /v1/ingest/{tenant}/{binding}<br/>body capped at 8 MiB"]
+        soap["POST /v1/ingest/{tenant}/{binding}/soap<br/>Oracle RIB"]
         filedrop["File-drop watcher<br/>adapters/filedrop"]
         opsapi["Operator endpoints<br/>bindings, deliveries, replay"]
     end
@@ -262,6 +262,7 @@ flowchart TB
     soap --> s1
     filedrop --> s1
     opsapi --> del
+    del -.->|"replay re-enters at step 1;<br/>the idempotency guard and Verify are bypassed"| s1
     s1 --> bind
     s1 --> reg --> iface
     iface -.-> a1
@@ -495,7 +496,7 @@ budget.
 ```mermaid
 flowchart TB
     subgraph tiers["The three tiers"]
-        t1["Tier 1 — rules engine<br/>pure, deterministic, sub-millisecond<br/>domain/rules.go, domain/constraints"]
+        t1["Tier 1 — rules engine<br/>pure, deterministic, sub-millisecond<br/>domain/rules.go — Constraints, Decision"]
         t2["Tier 2 — edge ML<br/>8 to 15 ms budget<br/>app/optimiser.go"]
         t3["Tier 3 — cloud optimisation<br/>asynchronous, every 15 minutes<br/>app/tier3.go"]
     end
@@ -526,6 +527,10 @@ flowchart TB
     http_p --> t1
     http_p --> t2
     http_p --> t3
+    http_p --> modreg
+    http_p --> train
+    http_p --> anom
+    http_p --> pack
     t1 --> rules
     t1 --> pack
     t2 --> t1
@@ -541,7 +546,6 @@ flowchart TB
     t2 --> fstore --> feat_d
     anom --> iso
     train --> gbt
-    train --> lstm
     train --> elas
     pack -.->|"shipped to the store gateway"| t1
 ```

@@ -130,6 +130,13 @@ day, 87.5% of them partial, half an NFC tap, 288 telemetry reports, 20 °C,
 | Data receive | 0.056 µA | <1% |
 | **Total** | **6.584 µA** | **8.67 years on 500 mAh** |
 
+This table is the projection with `CONFIG_USSLP_REQUIRE_ATTESTATION=n`. The
+shipped default has it on, which lengthens the receive window from 40 ms to
+60 ms and adds a verify term: data receive becomes 0.083 µA and a Verify row of
+0.005 µA appears, for **6.616 µA and 8.63 years**. `edge/labelsim/power.go`
+(`DefaultWorkload().EndToEndAttestation = true`) is the model both figures come
+from; neither has been measured on hardware.
+
 Half the budget is spent listening for beacons; nothing else is worth
 optimising until that is. The blueprint's literal 250 ms beacon interval,
 applied always, gives 211.3 µA and **99 days** — the firmware says so rather
@@ -153,7 +160,7 @@ flowchart TB
     p1["0x00c000 — 424 KiB<br/>slot0, the running image"]
     p2["0x076000 — 424 KiB<br/>slot1, the staged image"]
     p3["0x0e0000 — 96 KiB<br/>ota-scratch, staged delta patch,<br/>memory mapped"]
-    p4["0x0f8000 — 24 KiB<br/>storage, NVS<br/>sequence, ghosting counter, settings"]
+    p4["0x0f8000 — 24 KiB<br/>storage, NVS<br/>sequence, ghosting counter,<br/>key ring, provisioning record"]
     p5["0x0fe000 — 8 KiB<br/>identity, device key,<br/>ACL locked at boot"]
     p0 --> p1 --> p2 --> p3 --> p4 --> p5
 ```
@@ -173,8 +180,8 @@ updated at all. The 2.9″ build is estimated at ~343 KB, 81% of the slot.
 
 ```mermaid
 flowchart TB
-    subgraph appl["Application — src/app"]
-        main_c["main.c<br/>boot, thread and queue setup"]
+    subgraph appl["Application — src/app, plus src/main.c"]
+        main_c["src/main.c<br/>boot, thread and queue setup"]
         price_c["price.c<br/>the ordered price path"]
         prov_c["provision.c<br/>commissioning, battery projection"]
         tele_c["telemetry.c"]
@@ -244,7 +251,7 @@ behaviour that happens to work on every compiler anyone has tried).
 
 ```mermaid
 flowchart LR
-    d1["1 decode"] --> d2["2 sequence check"] --> d3["3 attestation"] --> d4["4 decode and load framebuffer"] --> d5["5 PERSIST SEQUENCE"] --> d6["6 drive the panel"] --> d7["7 acknowledge"]
+    d1["1 decode"] --> d2["2 sequence check"] --> d3["3 attestation"] --> d4["4 decode and load framebuffer"] --> d5["5 PERSIST SEQUENCE"] --> d6["6 drive the panel"] --> d6b["6b rewrite the NFC record"] --> d7["7 acknowledge"]
 ```
 
 Step 5 before step 6 is the whole design. A brownout during a 1.5 s refresh is a
@@ -275,7 +282,7 @@ flowchart TB
         end
 
         subgraph proc_c["usslp-sec process"]
-            sub_c["Zone subscriptions<br/>sec/{id}/labels/+/price,<br/>config, ota, zone/price"]
+            sub_c["Zone subscriptions — exactly two<br/>sec/{id}/labels/+/price,<br/>sec/{id}/zone/price"]
             verify_c["Attestation verifier<br/>KeyRing.VerifyAt,<br/>digest recomputed locally"]
             render_c["Zone rendering engine<br/>framebuffer, fonts, templates,<br/>per display tier"]
             diff_c["Waveform decision<br/>real pixel diff, colour-plane rule,<br/>25 percent and 50 percent limits"]

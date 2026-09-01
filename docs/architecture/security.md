@@ -50,7 +50,7 @@ Implemented in `platform/pkg/pki` (`ca.go`, `profile.go`). Six authorities.
 
 ```mermaid
 flowchart TB
-  ROOT["USSLP Root CA<br/>RSA-4096 - 20 years<br/>self-signed - offline<br/>key droppable from memory"]
+  ROOT["USSLP Root CA<br/>RSA-4096, signs with SHA-384 - 20 years<br/>self-signed - pathlen 2<br/>DropRootKey - held by no running service"]
 
   DEV["Device Issuance Intermediate<br/>RSA-2048 - 10 years - pathlen 1"]
   SVC["Services Intermediate<br/>RSA-2048 - 10 years - pathlen 0"]
@@ -60,8 +60,8 @@ flowchart TB
   SHC["Shelf Controller Sub-CA<br/>RSA-2048 - 5 years - pathlen 0"]
 
   LBL["Label leaf<br/>ECDSA P-256 - 2 years<br/>CN USSLP-LABEL-*"]
-  SEC["SEC leaf<br/>RSA-2048 - 1 year<br/>CN USSLP-SEC-*"]
-  SGU["SGU leaf<br/>RSA-2048 - 1 year<br/>CN USSLP-SGU-*"]
+  SECL["SEC leaf - cA FALSE<br/>RSA-2048 - 1 year<br/>CN USSLP-SEC-*"]
+  SGUL["SGU leaf - cA FALSE<br/>RSA-2048 - 1 year<br/>CN USSLP-SGU-*"]
   SVCL["Service leaf<br/>ECDSA P-256 - 90 days<br/>CN USSLP-SVC-*"]
   TENL["Tenant API client<br/>ECDSA P-256 - 1 year<br/>CN USSLP-TENANT-*"]
   JWTK["Tenant JWT signing keys<br/>ECDSA P-256 - ES256 - published JWKS"]
@@ -72,8 +72,8 @@ flowchart TB
   DEV --> MFG
   DEV --> SHC
   MFG --> LBL
-  SHC --> SEC
-  SHC --> SGU
+  SHC --> SECL
+  SHC --> SGUL
   SVC --> SVCL
   TEN --> TENL
   TEN --> JWTK
@@ -206,6 +206,49 @@ landing in 1.806 s, with a genuine certificate from the platform's own sub-CA.
 
 ## 4. mTLS everywhere, and the encryption matrix per hop
 
+The table reads hop by hop; the boundaries it crosses do not. The same
+information arranged by where the trust actually stops — and by the one thing
+that crosses every boundary unchanged.
+
+```mermaid
+flowchart LR
+  subgraph RET["Retailer estate - outside the platform"]
+    POS["POS or ERP"]
+  end
+
+  subgraph CLD["USSLP cloud - Istio PeerAuthentication STRICT, namespace-wide"]
+    UIG["UIG adapter"]
+    LSV["Label Service<br/>pki.PriceAuthority signs here"]
+    BRK["Cloud MQTT broker<br/>no Envoy sidecar<br/>ports 1883 and 8883 portLevelMtls DISABLE"]
+    KMS["At rest - KMS, one key per data domain,<br/>regional and never multi-region"]
+  end
+
+  subgraph STR["Store - back office and shop floor"]
+    SGU["Store Gateway Unit"]
+    SEC["Shelf Edge Controller"]
+    DSK["At rest - kvstore files are plain on disk,<br/>CRC-32C framing only. Full-disk encryption<br/>is a deployment responsibility"]
+  end
+
+  subgraph GLS["The glass"]
+    LBL["Label"]
+  end
+
+  POS -- "HTTPS. HMAC-SHA256 over the raw body,<br/>per binding, constant time, empty key fails closed" --> UIG
+  UIG -- "mTLS. SPIFFE service leaf, 90 days,<br/>ISTIO_MUTUAL restated per DestinationRule" --> LSV
+  LSV -- "mTLS. Service certificate, TenantAuthorizer" --> BRK
+  BRK -- "mTLS. SGU device certificate from the platform's<br/>own hierarchy; tenant read from cert Organization" --> SGU
+  SGU -- "mTLS. SEC device certificate" --> SEC
+  SEC -- "802.15.4 Zigbee 3.0 network-layer key,<br/>25 B MAC overhead" --> LBL
+
+  LSV -.-> KMS
+  SGU -.-> DSK
+
+  ATT["Ed25519 attestation over the canonical tuple.<br/>Signed once, at the Label Service"]
+  ATT -. "rides through unchanged" .-> BRK
+  ATT -. "SEC recomputes the digest from the update it holds" .-> SEC
+  ATT -. "label rebuilds the canonical string, frame type 4" .-> LBL
+```
+
 | Hop | Transport | Authentication | Confidentiality | Integrity of the price | Where |
 |---|---|---|---|---|---|
 | POS / ERP → UIG | HTTPS | HMAC-SHA256 over the raw body, per binding, constant-time compare | TLS | HMAC | `uig/adapter/verify.go` |
@@ -254,6 +297,41 @@ reasoning. The mechanism, in three sentences:
   that does not name its tenant literally** — `usslp/+/#` is rejected, because a
   `+` there matches every tenant on the broker.
 
+Three sentences describe the mechanism; below is every place the tenant is
+actually decided or enforced, on all four surfaces at once. Nothing in it reads
+a tenant from a request body — every arrow into the boundary starts at a
+credential.
+
+```mermaid
+flowchart TB
+  IN["Inbound HTTP request"]
+  SCRUB["The door - apigw authenticate middleware.<br/>scrubbedRequestHeaders deletes X-USSLP-Tenant,<br/>-Subject, -Roles, -Stores and the upstream selector,<br/>before authentication and before routing"]
+  CRED["Tenant comes only from the credential -<br/>API key, ES256 JWT against the published JWKS,<br/>or tenant client certificate"]
+  STAMP["Proxy stamps X-USSLP-Tenant from the principal"]
+  SCOPE["Store scope - p.AllowsStore on any route<br/>carrying a store path value"]
+  SVC["Service handler compares the resource's tenant<br/>with the principal's"]
+  NF["404 not found, never 403.<br/>Confirming an identifier exists is itself a leak"]
+
+  MQIN["MQTT CONNECT"]
+  TOF["DefaultTenantOf - the certificate's Organization<br/>wins over any username the device was told to send"]
+  ACL["withinTenant - the first two topic levels must both<br/>be literal. A wildcard at the tenant level is refused,<br/>because it matches every tenant"]
+
+  DEV["Device provisioning - registry Provision"]
+  CERTID["Identity, tenant included, is extracted from the<br/>verified certificate, never from the request body"]
+  MAN["manifestMismatch compares the manufacturing<br/>record's tenant against the certificate's"]
+  VAL["candidate.Validate - the last point a value that<br/>would break out of the tenant namespace is refused"]
+
+  EVT["Every envelope carries TenantID"]
+  LIMIT["The honest limit - one Kafka cluster serves every<br/>tenant. Isolation is the field plus each consumer's<br/>own filtering. A consumer bug is a leak"]
+
+  IN --> SCRUB --> CRED --> STAMP --> SCOPE --> SVC
+  SCOPE -- "store not in scope" --> NF
+  SVC -- "resource belongs to another tenant" --> NF
+  MQIN --> TOF --> ACL
+  DEV --> CERTID --> MAN --> VAL
+  SVC --> EVT --> LIMIT
+```
+
 Cross-tenant access returns **404, not 403**. Confirming that an identifier
 exists somewhere in the platform is itself a leak.
 
@@ -282,6 +360,37 @@ authority key lets the platform *authorise*.
 | `DefaultRetainedKeys` | 3 | Covers two unscheduled rotations inside one overlap window without unbounded growth of the ring, which every device downloads. |
 | Key states | `active`, `retiring` — **and no `revoked`** | A compromised signing key is removed from the ring *entirely* and every price it signed is re-signed. Leaving a compromised key listed in any state invites a verifier to accept it. |
 | Key identifier | `usslp-price-` + first 8 bytes of SHA-256 of the public key | Self-authenticating: an attacker cannot publish a ring entry claiming an existing `kid` with a substituted key, because the identifier would not match the bytes. 64 bits is enough — forging one requires a preimage, not a birthday collision. |
+
+What makes those constants safe is that a rotation requires no coordination with
+any device. Nothing on a shelf is re-signed, and a controller that has not
+synced yet is not wrong — it is still inside the overlap.
+
+```mermaid
+sequenceDiagram
+  participant OP as Operator
+  participant PA as pki.PriceAuthority
+  participant LS as Label Service
+  participant SEC as Shelf Edge Controller
+  participant LBL as Label
+
+  OP->>PA: Rotate at T
+  PA->>PA: generate an Ed25519 keypair. The kid is usslp-price- plus 8 bytes of SHA-256 of the public key
+  PA->>PA: the outgoing key becomes retiring, NotAfter set to T plus the 30-day overlap
+  PA->>PA: pruneLocked drops keys past their overlap, then trims to the 3 newest
+  PA-->>OP: new active kid, one WARN audit line naming both kids
+  PA->>PA: Save writes one PKCS-8 PEM per key at 0600 and ring.json at 0644
+  Note over PA: every key still inside its overlap is written, not just the active one.<br/>A restarted service must still answer for what it signed
+  LS->>PA: Sign
+  PA-->>LS: attestation carrying the new kid
+  PA-->>SEC: PublishKeyRing - active plus every retiring key
+  SEC->>SEC: VerifyAt resolves by kid, then checks that key's window
+  Note over SEC: a controller that has not synced still holds the retiring kid and keeps verifying.<br/>Unknown kid gives ErrUnknownKeyID, out of window gives ErrKeyRetired
+  LBL->>LBL: rebuilds the canonical string and verifies against its own copy of the ring
+  Note over PA,LBL: after 30 days the retiring key leaves the ring at the next prune.<br/>There is no revoked state
+  OP->>PA: Retire kid - the compromise path
+  PA-->>OP: refused while it is the active key. Rotate first
+  PA->>PA: key removed from the ring entirely. Every price it signed must be re-signed
+```
 
 The delegated store-scoped authority
 ([ADR 0003](../adr/0003-edge-first-architecture.md)) is the one exception, and it

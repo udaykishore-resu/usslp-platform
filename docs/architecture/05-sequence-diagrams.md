@@ -55,7 +55,7 @@ sequenceDiagram
     LS->>BUS: label-state and audit-log
     CB->>SGU: bridge downstream
     SGU->>SEC: local broker, inside the building
-    SEC->>SEC: recompute digest, verify, render,<br/>diff, choose waveform, reserve sequence
+    SEC->>SEC: recompute digest, verify, sequence check,<br/>render, diff, choose waveform, reserve sequence
     SEC->>LBL: attested air frame, up to 3 mesh hops
     LBL->>LBL: sequence check, verify, drive the panel
     LBL-->>SEC: ack applied, refresh ms, battery
@@ -134,13 +134,13 @@ service that might disagree about what was signed. And the device publish
 happens **before** the stream publishes, because the shelf is what the SLO
 measures and the analytics pipeline is not.
 
-Step 12 is retained. A controller rebooting after a power cut recovers the
+Step 11 is retained. A controller rebooting after a power cut recovers the
 current price of every label in its zone from the local broker without a round
 trip to a cloud that may be unreachable.
 
 Steps 14–17 are the controller's work and are covered in §6.
 
-Steps 18–22 close the loop. The ACK bridge subscribes to `canon.FilterAllACKs`
+Steps 18–23 close the loop. The ACK bridge subscribes to `canon.FilterAllACKs`
 on the cloud broker and republishes onto `label-delivery`; the delivery consumer
 folds it into the aggregate and the SLO read model. `DeliveryConfirmed` also
 resets a label previously marked offline to active — a confirmation is proof of
@@ -163,7 +163,7 @@ verify a price without trusting the controller that sent it.
 ### What the three-second claim does not cover
 
 - **A store that cannot be reached.** Held durably and applied in order when
-  the link returns; `make demo` measures one deliberately at 8–9.5 s, most of
+  the link returns; `make demo` measures one deliberately at 8–10 s, most of
   which is the outage. See §4.
 - **A store held at saturation.** 36 positions repriced together give p50
   1,847 ms and p99 3,551 ms with two thirds inside budget. See §3 and §9.
@@ -334,8 +334,8 @@ measured:
 
 | | Measured | Source |
 |---|---|---|
-| 24 shelf positions resolved, priced and published | **26 ms** | root README |
-| every panel settled | **3.9 s later** | root README |
+| 24 shelf positions resolved, priced and published | **26–52 ms** | root README |
+| every panel settled | **3.6–3.9 s later** | root README |
 | 36 items to 36 labels, platform side | **20 ms** | DEMO.md |
 | 36 positions repriced together, delivery | p50 **1,847 ms**, p95 3,473 ms, p99 **3,551 ms**, 66.7% inside the 3,000 ms budget | DEMO.md, root README |
 
@@ -525,7 +525,7 @@ sequenceDiagram
 | Entering autonomy | 3 consecutive failed probes spanning at least 12 s | `wan.go` |
 | Leaving autonomy | 4 consecutive successes spanning at least 15 s | `wan.go` |
 | Reconciliation settle window | 3 s | `sgu.Config.ReconcileSettle` |
-| A price changed during an outage, end to end | **8–9.5 s**, most of it the outage | DEMO.md, root README |
+| A price changed during an outage, end to end | **8–10 s**, most of it the outage | DEMO.md, root README |
 | Label downtime during the outage | **zero** — asserted per label by `TestStoreSurvivesWANOutage` | `test/e2e/outage_test.go` |
 
 ### Walkthrough
@@ -1136,7 +1136,7 @@ sequenceDiagram
 
     Note over TAG: the RF side is field powered.<br/>A flat cell still serves a price.
     PH->>TAG: RF field, NDEF read
-    TAG-->>PH: URI record to the product page with SKU and store,<br/>plus a text record with price and sequence
+    TAG-->>PH: URI record keyed by the label's own serial,<br/>which the retailer resolves to a product page,<br/>plus a text record with price and sequence
     TAG->>MCU: energy-harvest interrupt on GPO
     MCU->>PWR: open the activity window
     Note over PWR: a label somebody is standing in front of<br/>is a label worth being able to update quickly

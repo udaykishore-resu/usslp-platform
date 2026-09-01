@@ -213,13 +213,15 @@ flowchart TB
         t1["Send a real delivery"]
         t2{"Result status"}
         t3["Accepted or partial:<br/>GET /v1/pos/deliveries for the<br/>emitted count and row failures"]
-        t4["Quarantined — a 4xx with the body<br/>retained. Fix the mapping."]
+        t4["Quarantined, or partial — the body is<br/>retained either way. Fix the mapping."]
         t5["Operator replay: re-ingest past the<br/>dedupe guard, marked ReplayOf<br/>and ReplayCount"]
         t6["Rejected — it will never parse.<br/>The source is wrong, and the platform<br/>must not answer 500 to it."]
+        t7["Ignored — understood, and deliberately<br/>produced no change. Acknowledged,<br/>nothing emitted."]
         t1 --> t2
-        t2 -->|"accepted"| t3
-        t2 -->|"quarantined"| t4 --> t5 --> t1
+        t2 -->|"accepted or partial"| t3
+        t2 -->|"quarantined or partial"| t4 --> t5 --> t1
         t2 -->|"rejected"| t6
+        t2 -->|"ignored"| t7
     end
 
     s(["A retailer's POS or ERP<br/>needs to reach USSLP"]) --> q{"Is there an adapter<br/>for this vendor?"}
@@ -228,6 +230,7 @@ flowchart TB
     b5 --> f1
     f5 --> t1
     t3 --> live(["Live"])
+    t7 --> live
 ```
 
 **Why the four-method split is the whole design.** An adapter is a parser and a
@@ -260,8 +263,8 @@ flowchart TB
     p2a --> p2b["runbooks/mqtt-broker.md,<br/>runbooks/sgu-recovery.md"]
     p2b --> p2c["Watch USSLPSGUUpstreamQueueNearFull:<br/>it means critical evidence is about<br/>to be dropped and the cloud's record<br/>of the outage will have a hole"]
 
-    p3["Attestation refusal"] --> p3a{"Verdict on the ack"}
-    p3a -->|"unknown-key-id or<br/>key-outside-validity"| p3b["A stale key ring. Redistribute it.<br/>Not a compliance incident."]
+    p3["Attestation refusal"] --> p3a{"Status and verdict on the ack"}
+    p3a -->|"unknown-key-id or<br/>key-outside-validity-window"| p3b["A stale key ring. Redistribute it.<br/>Not a compliance incident."]
     p3a -->|"digest-mismatch"| p3c["The price on the wire is not the price<br/>that was signed. Compliance incident.<br/>runbooks/attestation-failure.md"]
     p3a -->|"status 4, unattested frame"| p3d["Fleet configuration: the controller needs<br/>updating. Operational queue, not the<br/>compliance one."]
 
@@ -359,16 +362,17 @@ flowchart TB
     s8 -->|"no"| part["PARTIAL. Transmit only<br/>the changed window."]
 ```
 
-### B1.3 Label — `planRefresh` has the last word
+### B1.3 Label — `planRefresh`, then the waveform driver, have the last word
 
 ```mermaid
 flowchart TB
     l1{"Partial requested and<br/>the panel supports one?"} -->|"no"| lf1["FULL waveform, 1500 ms on 2.9 in"]
     l1 -->|"yes"| l2{"partialsSinceFull has reached<br/>the panel's MaxPartials, 8?"}
     l2 -->|"yes"| lf2["FULL, and ForcedFull is reported upward<br/>so the controller's energy model learns<br/>it did not get what it asked for"]
-    l2 -->|"no"| l3{"Below about minus 10 C?<br/>a driver-level rule the policy cannot know"}
-    l3 -->|"yes"| lf3["FULL. A single-phase drive does not<br/>complete at that temperature and<br/>produces a smeared digit."]
-    l3 -->|"no"| lp["PARTIAL waveform, 300 ms"]
+    l2 -->|"no"| lp["PARTIAL planned, 300 ms"]
+    lp --> d1{"Driver: panel below about minus 10 C?<br/>usslp_waveform_lut has no partial LUT<br/>in the freezer band"}
+    d1 -->|"yes"| d2["FULL. A single-phase drive does not<br/>complete at that temperature and<br/>produces a smeared digit. The plan is<br/>const, so the ack still reports PARTIAL."]
+    d1 -->|"no"| d3["PARTIAL waveform, 300 ms"]
 ```
 
 **Why the label has the last word.** Only the label knows how many partials
